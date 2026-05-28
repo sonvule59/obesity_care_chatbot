@@ -4,6 +4,7 @@ const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_SECRET_KEY;
 if (!GROQ_API_KEY) {
   throw new Error("VITE_GROQ_API_SECRET_KEY is not set in .env");
 }
+const GROQ_MODEL = import.meta.env.VITE_GROQ_MODEL || "llama-3.3-70b-versatile";
 
 async function callGroq(messages, systemPrompt, onChunk) {
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -13,9 +14,9 @@ async function callGroq(messages, systemPrompt, onChunk) {
       "Authorization": `Bearer ${GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      model: "llama-3.3-70b-versatile",
-      max_tokens: 1000,
-      temperature: 0.7,
+      model: GROQ_MODEL,
+      max_tokens: 500,
+      temperature: 0.3,
       stream: true,
       messages: [
         { role: "system", content: systemPrompt },
@@ -122,11 +123,13 @@ function extractInstrumentJson(text) {
   return null;
 }
 
-async function persistInstrumentSubmission({ instrumentKey, instrumentLabel, responses }) {
+async function persistInstrumentSubmission({ instrumentKey, instrumentLabel, responses, patient, condition, conditionLabel }) {
   const record = {
     submittedAt: new Date().toISOString(),
-    participantId: PATIENT.id,
-    participantName: PATIENT.name,
+    participantId: patient.id,
+    participantName: patient.name,
+    condition: condition ?? "",
+    conditionLabel: conditionLabel ?? "",
     instrumentKey,
     instrumentLabel,
     responses,
@@ -149,6 +152,77 @@ async function persistInstrumentSubmission({ instrumentKey, instrumentLabel, res
   } catch (e) {
     console.warn("Google Sheet POST failed:", e);
   }
+}
+
+// ─── Conversation store ────────────────────────────────────────
+const CONV_STORE_KEY = "confidentMoves_conversations";
+
+function readConvStore() {
+  try {
+    const raw = localStorage.getItem(CONV_STORE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeConvStore(store) {
+  try {
+    localStorage.setItem(CONV_STORE_KEY, JSON.stringify(store));
+  } catch (e) {
+    console.warn("Conversation store write failed:", e);
+  }
+}
+
+function makeConversationKey(moduleId, profileId, conditionId) {
+  return `${moduleId}_${profileId}_${conditionId}`;
+}
+
+function saveConversation(conversationKey, moduleId, moduleLabel, messages, meta = {}) {
+  const store = readConvStore();
+  store[conversationKey] = {
+    conversationKey,
+    moduleId,
+    moduleLabel,
+    profileId: meta.profileId ?? "",
+    profileName: meta.profileName ?? "",
+    condition: meta.condition ?? "",
+    conditionLabel: meta.conditionLabel ?? "",
+    messages,
+    lastUpdated: new Date().toISOString(),
+  };
+  writeConvStore(store);
+}
+
+function clearConversation(moduleId) {
+  const store = readConvStore();
+  delete store[moduleId];
+  writeConvStore(store);
+}
+
+function convStoreToCsv(store) {
+  const headers = ["profileId", "profileName", "condition", "conditionLabel", "moduleId", "moduleLabel", "lastUpdated", "turn", "role", "ts", "content"];
+  const lines = [headers.join(",")];
+  for (const entry of Object.values(store)) {
+    entry.messages.forEach((msg, idx) => {
+      lines.push([
+        csvEscapeCell(entry.profileId),
+        csvEscapeCell(entry.profileName),
+        csvEscapeCell(entry.condition),
+        csvEscapeCell(entry.conditionLabel),
+        csvEscapeCell(entry.moduleId),
+        csvEscapeCell(entry.moduleLabel),
+        csvEscapeCell(entry.lastUpdated),
+        csvEscapeCell(idx + 1),
+        csvEscapeCell(msg.role),
+        csvEscapeCell(msg.ts ?? ""),
+        csvEscapeCell(msg.content),
+      ].join(","));
+    });
+  }
+  return lines.join("\r\n");
 }
 
 // ─── Theme tokens ──────────────────────────────────────────────
@@ -185,45 +259,510 @@ const T = {
   chatUserAvatarFg: "#1e293b",
 };
 
-// ─── Patient data (baselines; program day/week + self-report from state) ────
-const PATIENT = {
-  name: "Son Vu",
-  id: "PT-0001",
-  trial: "Pilot Trial",
-  drug: "Semaglutide 2.4mg",
-  totalWeeks: 24,
-  bmi: { current: 34.2, baseline: 38.1 },
-  weight: { current: 198, baseline: 207, unit: "lbs", goal: 177 },
-  adherence: 94,
-  doctor: "Confident Moves Obesity Care Team",
-  conditions: ["Type 2 diabetes", "Hypertension"],
-  medications: ["Metformin 500mg", "Lisinopril 10mg"],
-  pa: {
-    weeklyGoalMins: 150,
-    goalDays: 5,
-    topBarrier: "time constraints",
-    favoriteActivity: "walking",
-  },
+// ─── Research profiles & conditions ───────────────────────────
+const PROFILES_STORAGE_KEY = "confidentMoves_profiles_v1";
+const ACTIVE_PROFILE_KEY = "confidentMoves_active_profile";
+const ACTIVE_CONDITION_KEY = "confidentMoves_active_condition";
+const LEGACY_PROGRAM_STATE_KEY = "confidentMoves_program_v1";
+
+const ALL_INSTRUMENT_KEYS = ["inst1", "inst2", "inst3", "inst4", "inst5", "inst6"];
+
+const CONDITIONS = [
+  { id: "A", label: "Nothing", description: "Baseline — no behavior-change theory, no instruments in prompt", instruments: [], includeTheory: false },
+  { id: "B", label: "Theories only", description: "Bandura/BCT coaching — no instruments in prompt", instruments: [], includeTheory: true },
+  { id: "C", label: "Theories + instruments", description: "Bandura/BCT coaching + all assessment instruments in the prompt at once", instruments: ALL_INSTRUMENT_KEYS, includeTheory: true },
+];
+
+const INSTRUMENT_LABELS = {
+  inst1: "Demographic Information",
+  inst2: "Job-Related PA Self-Efficacy (J-R PASE)",
+  inst3: "Transportation-Related PA Self-Efficacy (T-R PASE)",
+  inst4: "Domestic-Related PA Self-Efficacy (D-R PASE)",
+  inst5: "Leisure-Related PA Self-Efficacy (L-R PASE)",
+  inst6: "Barrier Self-Efficacy (SERPA)",
 };
 
-const TOTAL_PROGRAM_DAYS = PATIENT.totalWeeks * 7;
-const PROGRAM_STATE_KEY = "confidentMoves_program_v1";
+const INSTRUMENT_TEXTS = {
+  inst1: `INSTRUMENT ITEMS (ask in this order)
+1. What is your gender?
+Female
+Male
+2. Please estimate your household's current annual income.
+________________
+3. What is your ethnicity?
+Hispanic or Latino
+Not Hispanic or Latino
 
-const defaultProgramState = () => ({
-  programDay: 1,
-  currentWeight: PATIENT.weight.current,
-  weekPaMins: 0,
-  activeDaysThisWeek: 0,
-  lastPaLogProgramDay: null,
-  lastActiveMarkProgramDay: null,
-});
+4. What is your race?
+American Indian or Alaska Native
+Asian
+Black or African American
+Native Hawaiian or Other Pacific Islander
+White
+More than one race
 
-function loadProgramState() {
+5. Please indicate the highest level of education you have completed.
+Grammar School
+High School or equivalent
+Vocational/Technical School (2 year)
+Some College
+College Graduate (4 year)
+Master's Degree (MS)
+Doctoral Degree (PhD)
+Professional Degree (MD, JD, etc.)
+Other
+
+6. What is your current marital status?
+Divorced
+Living with partner
+Married
+Separated
+Single
+Widowed
+
+7. What is your employment status?
+Full Time
+Part Time
+Retired
+Unemployed`,
+  inst2: 
+  `JOB-RELATED PHYSICAL ACTIVITY SELF-EFFICACY (J-R PASE)
+
+Think about how confident you are in your current ability 
+to engage in job-related physical activity at a moderate 
+level of intensity in the next week.
+
+Job-related refers to paid jobs, farming, volunteer work, 
+coursework, and any other unpaid work done outside the home.
+Physical activity refers to any physical activities done 
+for at least 10 minutes at a time.
+Moderate intensity means activities that take moderate 
+physical effort and make you breathe somewhat harder 
+than normal (e.g., work requiring moderate lifting or walking).
+
+Scale: 0=No Confidence, 1=Low, 2=Moderate, 3=High, 4=Complete Confidence
+
+ADMINISTRATION RULE: If patient answers 0 (No Confidence) 
+for any item, do not ask further items. Record 0 for 
+all remaining items.
+
+Items (ask one at a time):
+1. How confident are you in your ability to engage in 
+   job-related PA at moderate intensity for at least 
+   10 minutes in the next week? (0-4)
+
+2. ...for at least 30 minutes in the next week? (0-4)
+
+3. ...for at least 60 minutes in the next week? (0-4)
+
+4. ...for at least 90 minutes in the next week? (0-4)
+
+5. ...for at least 120 minutes in the next week? (0-4)
+
+6. ...for at least 150 minutes in the next week? (0-4)
+
+SCORING: Sum all answered items. Higher = greater SE for job-related PA.
+Maximum = 24 (4 points × 6 items).
+Score of 0 on item 1 = very low SE even for minimal job-related PA.
+
+COACHING INTERPRETATION:
+Score 0-8 (Low): Patient has low confidence for job-related PA.
+  → Focus on identifying existing movement in work context
+  → Micro-goals: notice and extend current work movement
+  → Never suggest adding new activity at work yet
+
+Score 9-16 (Moderate): Some confidence.
+  → Collaborative goal-setting around work-based activity
+  → Action planning: when/where during workday
+
+Score 17-24 (High): Strong confidence.
+  → Work is an SE strength — build from here
+  → Can set more ambitious work-related PA goals
+
+After all items complete, output:
+[INSTRUMENT_DATA: {"instrument": "J-R PASE", "item1": , "item2": , "item3": , "item4": , "item5": , "item6": , "total_score": }]`,
+
+  inst3: `TRANSPORTATION-RELATED PHYSICAL ACTIVITY SELF-EFFICACY (T-R PASE)
+
+Think about how confident you are in your current ability 
+to engage in transportation-related physical activity at 
+a moderate level of intensity in the next week.
+
+Transportation-related refers to how you travel from place 
+to place — to work, stores, movies, and so on.
+Physical activity refers to any physical activities done 
+for at least 10 minutes at a time.
+Moderate intensity means activities that take moderate 
+physical effort and make you breathe somewhat harder 
+than normal (e.g., walking or moderate cycling as transport).
+
+Scale: 0=No Confidence, 1=Low, 2=Moderate, 3=High, 4=Complete Confidence
+
+ADMINISTRATION RULE: If patient answers 0 (No Confidence) 
+for any item, do not ask further items.
+
+Items (ask one at a time):
+1. How confident are you in your ability to engage in 
+   transportation-related PA at moderate intensity for 
+   at least 10 minutes in the next week? (0-4)
+
+2. ...for at least 30 minutes in the next week? (0-4)
+
+3. ...for at least 60 minutes in the next week? (0-4)
+
+4. ...for at least 90 minutes in the next week? (0-4)
+
+5. ...for at least 120 minutes in the next week? (0-4)
+
+6. ...for at least 150 minutes in the next week? (0-4)
+
+SCORING: Sum all answered items. Maximum = 24.
+
+COACHING INTERPRETATION:
+Score 0-8 (Low): Patient has low confidence walking/cycling as transport.
+  → Explore current transportation patterns
+  → Identify one regular destination where a short walk is possible
+  → Parking further away, one transit stop early — both count
+  → Micro-goal: add 5-10 minutes of walking to one regular trip
+
+Score 9-16 (Moderate):
+  → Action plan around specific regular trips
+  → Which destinations, which days, how far
+
+Score 17-24 (High): Transportation is an SE strength.
+  → Build on existing active transport habits
+  → Extend duration or add new destinations
+
+After all items complete, output:
+[INSTRUMENT_DATA: {"instrument": "T-R PASE", "item1": , "item2": , "item3": , "item4": , "item5": , "item6": , "total_score": }]`,
+
+  inst4: `DOMESTIC-RELATED PHYSICAL ACTIVITY SELF-EFFICACY (D-R PASE)
+
+Think about how confident you are in your current ability 
+to engage in domestic-related physical activity at a 
+moderate level of intensity in the next week.
+
+Domestic-related refers to physical activities done in 
+and around your home — housework, gardening, yard work, 
+general maintenance, and caring for your family.
+Physical activity refers to any physical activities done 
+for at least 10 minutes at a time.
+Moderate intensity means activities that take moderate 
+physical effort and make you breathe somewhat harder 
+than normal (e.g., housework requiring moderate lifting or walking).
+
+Scale: 0=No Confidence, 1=Low, 2=Moderate, 3=High, 4=Complete Confidence
+
+ADMINISTRATION RULE: If patient answers 0 (No Confidence) 
+for any item, do not ask further items.
+
+Items (ask one at a time):
+1. How confident are you in your ability to engage in 
+   domestic-related PA at moderate intensity for at 
+   least 10 minutes in the next week? (0-4)
+
+2. ...for at least 30 minutes in the next week? (0-4)
+
+3. ...for at least 60 minutes in the next week? (0-4)
+
+4. ...for at least 90 minutes in the next week? (0-4)
+
+5. ...for at least 120 minutes in the next week? (0-4)
+
+6. ...for at least 150 minutes in the next week? (0-4)
+
+SCORING: Sum all answered items. Maximum = 24.
+
+COACHING INTERPRETATION:
+Score 0-8 (Low): Low confidence for domestic PA.
+  → Validate that housework, gardening, and family care 
+    ARE real physical activity
+  → Help patient recognize movement they may not count
+  → Reframe existing domestic activity as PA achievement
+  → Micro-goal: notice and extend one existing domestic activity
+
+Score 9-16 (Moderate):
+  → Set goals around intensifying or extending existing 
+    domestic movement
+  → Gardening, active housework, active play with children
+
+Score 17-24 (High): Home is an SE strength.
+  → Evening or weekend domestic activity as starting point
+  → Connect home-based success to other PA domains
+
+After all items complete, output:
+[INSTRUMENT_DATA: {"instrument": "D-R PASE", "item1": , "item2": , "item3": , "item4": , "item5": , "item6": , "total_score": }]`,
+  inst5: `LEISURE-RELATED PHYSICAL ACTIVITY SELF-EFFICACY (L-R PASE)
+
+Think about how confident you are in your current ability 
+to engage in leisure-related physical activity in the 
+next week.
+
+Leisure-related refers to physical activities done solely 
+for recreation, sport, exercise, or leisure.
+Physical activity refers to any physical activities done 
+for at least 10 minutes at a time.
+
+PART A — MODERATE INTENSITY
+Moderate intensity: activities that take moderate physical 
+effort and make you breathe somewhat harder than normal 
+(e.g., leisure activities requiring moderate lifting or walking).
+
+Scale: 0=No Confidence, 1=Low, 2=Moderate, 3=High, 4=Complete Confidence
+ADMINISTRATION RULE: Stop if patient answers 0 on any item.
+
+Items — Moderate (ask one at a time):
+1. How confident are you in your ability to engage in 
+   leisure PA at MODERATE intensity for at least 
+   10 minutes in the next week? (0-4)
+
+2. ...for at least 30 minutes? (0-4)
+
+3. ...for at least 60 minutes? (0-4)
+
+4. ...for at least 90 minutes? (0-4)
+
+5. ...for at least 120 minutes? (0-4)
+
+6. ...for at least 150 minutes? (0-4)
+
+PART B — VIGOROUS INTENSITY
+Vigorous intensity: activities that take hard physical 
+effort and make you breathe much harder than normal 
+(e.g., running, intense exercise).
+
+Items — Vigorous (ask one at a time):
+1. How confident are you in your ability to engage in 
+   leisure PA at VIGOROUS intensity for at least 
+   10 minutes in the next week? (0-4)
+
+2. ...for at least 15 minutes? (0-4)
+
+3. ...for at least 30 minutes? (0-4)
+
+4. ...for at least 45 minutes? (0-4)
+
+5. ...for at least 60 minutes? (0-4)
+
+6. ...for at least 75 minutes? (0-4)
+
+SCORING: 
+Moderate subscale: sum items A1-A6. Maximum = 24.
+Vigorous subscale: sum items B1-B6. Maximum = 24.
+
+COACHING INTERPRETATION:
+Low moderate score (0-8): 
+  → Start with most accessible leisure activity: walking
+  → 10-minute neighborhood walks, mall walking, park visits
+  → Never suggest vigorous activity yet
+
+Low vigorous only (moderate score 9-24, vigorous 0-8):
+  → Patient ready for moderate leisure but not vigorous
+  → Do NOT suggest running or intense exercise
+  → Build mastery at moderate first
+  → "Your confidence for moderate activity is strong — 
+    let's keep building there before stepping up intensity"
+
+High both scores:
+  → Leisure is a major SE strength
+  → Explore recreational activities patient enjoys
+  → Connect past leisure activities to current goals
+
+After all items complete, output:
+[INSTRUMENT_DATA: {"instrument": "L-R PASE", "moderate_items": {"item1": , "item2": , "item3": , "item4": , "item5": , "item6": }, "vigorous_items": {"item1": , "item2": , "item3": , "item4": , "item5": , "item6": }, "moderate_total": , "vigorous_total": }]`,
+  inst6: `SELF-EFFICACY TO REGULATE PHYSICAL ACTIVITY (SERPA)
+
+Think about how confident you are in your current ability 
+to overcome possible barriers to engagement in a 
+recommended amount of weekly physical activity for health.
+
+Recommended amounts include:
+- At least 150 minutes per week of moderate PA, OR
+- At least 75 minutes per week of vigorous PA, OR
+- An equivalent combination of both
+
+Moderate PA: activities like carrying light loads, 
+raking, moderate cycling — breathing somewhat harder than normal.
+Vigorous PA: activities like heavy lifting, chopping wood, 
+intense cycling — breathing much harder than normal.
+
+Scale: 0=No Confidence, 1=Low, 2=Moderate, 3=High, 4=Complete Confidence
+
+Items (ask one at a time — do NOT skip any):
+How confident are you in your current ability to engage 
+in a recommended amount of weekly physical activity when...
+
+1. The weather is very bad? (0-4)
+2. You are bored with the physical activities available to you? (0-4)
+3. You are on vacation? (0-4)
+4. You are uninterested in the physical activities available? (0-4)
+5. You feel physical discomfort while being physically active? (0-4)
+6. You have to be physically active by yourself? (0-4)
+7. You do not enjoy the physical activities available? (0-4)
+8. It is difficult to get to a location suitable for PA? (0-4)
+9. You do not like the physical activities available? (0-4)
+10. Your schedule conflicts with being physically active? (0-4)
+11. You feel self-conscious about your appearance while being 
+    physically active? (0-4)
+12. You do not receive any encouragement for being physically 
+    active? (0-4)
+13. You are under personal stress? (0-4)
+
+SCORING: Sum all 13 items. Maximum = 52.
+Higher scores = greater confidence to overcome barriers.
+
+COACHING INTERPRETATION BY ITEM:
+Item 1 (weather, score 0-1): 
+  → Major barrier. Explore indoor alternatives, home-based options.
+
+Items 2, 4, 7, 9 (boredom/interest, score 0-1):
+  → Patient finds available activities unappealing.
+  → Explore what they have ever found tolerable.
+  → Connect to higher-scoring PA domain.
+
+Item 5 (physical discomfort, score 0-1):
+  → CRITICAL: validate discomfort first. Never push through.
+  → Lower intensity and shorter duration goals only.
+  → Chair-based or gentle movement options.
+
+Item 6 (alone, score 0-1):
+  → Lack of social support undermines SE.
+  → Explore social options. If none: normalize solo activity.
+
+Item 8 (access, score 0-1):
+  → Remove location dependency. Home-based first.
+  → Transportation PA as alternative.
+
+Item 10 (schedule, score 0-1):
+  → CRITICAL: time barrier. Explore actual vs perceived time.
+  → Identify schedule anchors. 10 minutes is enough.
+
+Item 11 (self-consciousness, score 0-1):
+  → CRITICAL for obesity population. Validate without judgment.
+  → Home-based or low-visibility options first.
+  → NEVER comment on appearance or weight.
+
+Item 12 (no encouragement, score 0-1):
+  → Your coaching role is to provide social persuasion SE source.
+  → Provide specific genuine affirmation in every session.
+
+Item 13 (stress, score 0-1):
+  → Validate stress fully first.
+  → Survival mode goals: smallest possible commitment.
+
+After all items complete, output:
+[INSTRUMENT_DATA: {"instrument": "SERPA", "item1": , "item2": , "item3": , "item4": , "item5": , "item6": , "item7": , "item8": , "item9": , "item10": , "item11": , "item12": , "item13": , "total_score": }]`,
+};
+
+const INSTRUMENT_PROMPT_SUMMARIES = {
+  inst1: "Demographics context only: gender, income, ethnicity, race, education, marital status, employment. Use for context tailoring only.",
+  inst2: "J-R PASE (job-related self-efficacy): 6 items, score 0-24. Higher means greater confidence for work/volunteer/course-related activity.",
+  inst3: "T-R PASE (transport self-efficacy): 6 items, score 0-24. Higher means greater confidence for active transport (walking/cycling).",
+  inst4: "D-R PASE (domestic self-efficacy): 6 items, score 0-24. Higher means greater confidence for home/family physical activity.",
+  inst5: "L-R PASE (leisure self-efficacy): 12 items with moderate/vigorous subdomains. Use profile (moderate vs vigorous confidence) to set intensity.",
+  inst6: "SERPA (barrier self-efficacy): 13 items, score 0-13. Lower scores indicate key barriers (time, fatigue, weather, stress, confidence) needing small-step planning.",
+};
+
+const COACHING_SYSTEM_KEYS = ["chat", "checkin", "education"];
+
+const DEFAULT_PROFILES = [
+  {
+    id: "PT-0001",
+    name: "Son Vu",
+    trial: "Pilot Trial",
+    drug: "Semaglutide 2.4mg",
+    totalWeeks: 24,
+    startProgramDay: 1,
+    bmi: { current: 34.2, baseline: 38.1 },
+    weight: { current: 198, baseline: 207, unit: "lbs", goal: 177 },
+    adherence: 94,
+    doctor: "Confident Moves Obesity Care Team",
+    conditions: ["Type 2 diabetes", "Hypertension"],
+    medications: ["Metformin 500mg", "Lisinopril 10mg"],
+    pa: { weeklyGoalMins: 150, goalDays: 5, topBarrier: "time constraints", favoriteActivity: "walking" },
+  },
+  {
+    id: "PT-0002",
+    name: "Maria Reyes",
+    trial: "Pilot Trial",
+    drug: "Semaglutide 2.4mg",
+    totalWeeks: 24,
+    startProgramDay: 1,
+    bmi: { current: 36.1, baseline: 37.8 },
+    weight: { current: 212, baseline: 218, unit: "lbs", goal: 185 },
+    adherence: 88,
+    doctor: "Confident Moves Obesity Care Team",
+    conditions: ["Hypertension", "Osteoarthritis"],
+    medications: ["Lisinopril 10mg", "Acetaminophen PRN"],
+    pa: { weeklyGoalMins: 150, goalDays: 5, topBarrier: "joint pain", favoriteActivity: "water aerobics" },
+  },
+  {
+    id: "PT-0003",
+    name: "David Kim",
+    trial: "Pilot Trial",
+    drug: "Semaglutide 2.4mg",
+    totalWeeks: 24,
+    startProgramDay: 1,
+    bmi: { current: 31.5, baseline: 33.2 },
+    weight: { current: 188, baseline: 195, unit: "lbs", goal: 170 },
+    adherence: 91,
+    doctor: "Confident Moves Obesity Care Team",
+    conditions: ["Prediabetes"],
+    medications: ["Metformin 500mg"],
+    pa: { weeklyGoalMins: 150, goalDays: 5, topBarrier: "lack of social support", favoriteActivity: "cycling" },
+  },
+];
+
+function cloneProfiles(profiles) {
+  return JSON.parse(JSON.stringify(profiles));
+}
+
+function readProfiles() {
   try {
-    const raw = localStorage.getItem(PROGRAM_STATE_KEY);
+    const raw = localStorage.getItem(PROFILES_STORAGE_KEY);
+    if (!raw) return cloneProfiles(DEFAULT_PROFILES);
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) return cloneProfiles(DEFAULT_PROFILES);
+    return parsed;
+  } catch {
+    return cloneProfiles(DEFAULT_PROFILES);
+  }
+}
+
+function writeProfiles(profiles) {
+  try {
+    localStorage.setItem(PROFILES_STORAGE_KEY, JSON.stringify(profiles));
+  } catch (e) {
+    console.warn("Profile save failed:", e);
+  }
+}
+
+function getTotalProgramDays(patient) {
+  return patient.totalWeeks * 7;
+}
+
+function programStateKey(profileId) {
+  return `confidentMoves_program_${profileId}`;
+}
+
+function defaultProgramState(patient) {
+  const day = Math.max(1, Number(patient.startProgramDay) || 1);
+  return {
+    programDay: day,
+    currentWeight: patient.weight.current,
+    weekPaMins: 0,
+    activeDaysThisWeek: 0,
+    lastPaLogProgramDay: null,
+    lastActiveMarkProgramDay: null,
+  };
+}
+
+function loadProgramState(profileId, patient) {
+  try {
+    const raw = localStorage.getItem(programStateKey(profileId));
     if (!raw) return null;
     const d = JSON.parse(raw);
-    const base = defaultProgramState();
+    const base = defaultProgramState(patient);
     if (typeof d.programDay !== "number" || d.programDay < 1) return null;
     return { ...base, ...d, programDay: d.programDay };
   } catch {
@@ -231,10 +770,40 @@ function loadProgramState() {
   }
 }
 
-function estBmiFromWeight(weightLbs) {
+function migrateLegacyProgramState(profileId) {
+  try {
+    const legacy = localStorage.getItem(LEGACY_PROGRAM_STATE_KEY);
+    if (!legacy || localStorage.getItem(programStateKey(profileId))) return;
+    localStorage.setItem(programStateKey(profileId), legacy);
+  } catch {}
+}
+
+function estBmiFromWeight(weightLbs, patient) {
   const w = Number(weightLbs);
-  if (!Number.isFinite(w) || w <= 0) return PATIENT.bmi.baseline.toFixed(1);
-  return ((PATIENT.bmi.baseline * w) / PATIENT.weight.baseline).toFixed(1);
+  if (!Number.isFinite(w) || w <= 0) return patient.bmi.baseline.toFixed(1);
+  return ((patient.bmi.baseline * w) / patient.weight.baseline).toFixed(1);
+}
+
+function buildInstrumentInjectionBlock(conditionId) {
+  const cond = CONDITIONS.find(c => c.id === conditionId);
+  if (!cond?.instruments?.length) return "";
+  const parts = cond.instruments.map(key => {
+    const label = INSTRUMENT_LABELS[key] ?? key;
+    // const text = INSTRUMENT_TEXTS[key] ?? "";
+    const text = INSTRUMENT_PROMPT_SUMMARIES[key] ?? "";
+    return `--- ${key.toUpperCase()}: ${label} ---\n${text}`;
+  });
+  return `\n\nRESEARCH ASSESSMENT INSTRUMENTS (compact coaching reference; all instruments included below. Use these to tailor support, but do not run full survey administration in this chat unless the participant requests it):\n\n${parts.join("\n\n")}`;
+}
+
+function applyConditionToSystems(systems, conditionId) {
+  const block = buildInstrumentInjectionBlock(conditionId);
+  if (!block) return systems;
+  const out = { ...systems };
+  for (const key of COACHING_SYSTEM_KEYS) {
+    if (out[key]) out[key] = out[key] + block;
+  }
+  return out;
 }
 
 /** Days from real "today" until the next scheduled visit (sidebar + Progress). */
@@ -274,7 +843,7 @@ function formatMonthDayShort(date) {
  * Son and Dr. Lee can add additional prompts to the system messages if needed.
  * We will design prompts for the other instruments later.
 */
-function buildSystems(rt) {
+function buildSystems(rt, patient, conditionId = "A") {
   const {
     programDay,
     programWeek,
@@ -285,14 +854,24 @@ function buildSystems(rt) {
     activeDaysThisWeek,
     activeDaysGoal,
   } = rt;
+  const totalProgramDays = getTotalProgramDays(patient);
+  const withTheory = CONDITIONS.find(c => c.id === conditionId)?.includeTheory ?? conditionId !== "A";
 
-  return {
-  chat: `You are ObesityCare AI, a clinical support assistant embedded in an obesity management trial platform. Your coaching is grounded in social cognitive theory — specifically Bandura's self-efficacy — and in common elements of evidence-based behavior change techniques (BCTs) used in lifestyle trials (e.g., goal setting, action planning, problem solving, self-monitoring of behavior).
+  const patientContext = `Patient: ${patient.name}, Trial: ${patient.trial}, Drug: ${patient.drug}.
+Program timeline: Day ${programDay} of ${totalProgramDays} (week ${programWeek} of ${patient.totalWeeks}).
+Self-report: weight ${currentWeight} lbs; estimated BMI ~${estBmi} (baseline BMI ${patient.bmi.baseline}); this week's PA total ${weeklyPaMins} / ${weeklyPaGoal} min; active days with movement this week: ${activeDaysThisWeek} / ${activeDaysGoal}.
+Comorbidities: ${patient.conditions.join(", ")}.
+Top PA barrier: ${patient.pa.topBarrier}. Favorite activity: ${patient.pa.favoriteActivity}.`;
 
-Patient: ${PATIENT.name}, Trial: ${PATIENT.trial}, Drug: ${PATIENT.drug}.
-Program timeline: Day ${programDay} of ${TOTAL_PROGRAM_DAYS} (week ${programWeek} of ${PATIENT.totalWeeks}).
-Self-report: weight ${currentWeight} lbs; estimated BMI ~${estBmi} (baseline BMI ${PATIENT.bmi.baseline}); this week's PA total ${weeklyPaMins} / ${weeklyPaGoal} min; active days with movement this week: ${activeDaysThisWeek} / ${activeDaysGoal}.
-Comorbidities: ${PATIENT.conditions.join(", ")}.
+  const operatingRules = `OPERATING RULES
+- Never diagnose, prescribe, or change medication instructions. Defer medical decisions to the care team.
+- Keep replies concise (2–5 sentences) unless the user asks for detail.
+- Flag severe side effects, distress, self-harm, or safety concerns with [ESCALATE].
+- You may discuss GLP-1 therapy, obesity, nutrition, PA, and the trial in general educational terms.`;
+
+  const chatTrained = `You are ObesityCare AI, a clinical support assistant embedded in an obesity management trial platform. Your coaching is grounded in social cognitive theory — specifically Bandura's self-efficacy — and in common elements of evidence-based behavior change techniques (BCTs) used in lifestyle trials (e.g., goal setting, action planning, problem solving, self-monitoring of behavior).
+
+${patientContext}
 
 THEORY-DRIVEN COMMUNICATION (self-efficacy)
 Self-efficacy is the person's confidence that they can perform a behavior in a given context. In practice, support mastery, credible encouragement, context, and emotional safety — not generic praise.
@@ -308,14 +887,16 @@ EVIDENCE-ALIGNED STRATEGIES (use when relevant; do not stack all in one reply)
 - Problem solving: Identify barrier → brainstorm one or two options → patient picks; avoid solving for them.
 - Motivational interviewing style: Open questions, affirm effort, reflect, summarize; no lecturing.
 
-OPERATING RULES
-- Never diagnose, prescribe, or change medication instructions. Defer medical decisions to the care team.
-- Keep replies concise (2–5 sentences) unless the user asks for detail.
-- Flag severe side effects, distress, self-harm, or safety concerns with [ESCALATE].
-- You may discuss GLP-1 therapy, obesity, nutrition, PA, and the trial in general educational terms.`,
+${operatingRules}`;
 
-  checkin: `You are ObesityCare Confident Moves AI conducting a structured daily check-in for a clinical trial participant. Use brief, collaborative language consistent with motivational interviewing and self-efficacy support (acknowledge effort; ask one thing at a time; no judgment).
-Patient: ${PATIENT.name}, program day ${programDay} (week ${programWeek}), Drug: ${PATIENT.drug}.
+  const chatBaseline = `You are ObesityCare AI, a supportive assistant for participants in an obesity management trial. Answer questions helpfully about physical activity, lifestyle, and the program. Be warm and practical. Do not use formal behavior-change theory frameworks, named psychological models, or structured coaching protocols unless the participant explicitly asks for them.
+
+${patientContext}
+
+${operatingRules}`;
+
+  const checkinTrained = `You are ObesityCare Confident Moves AI conducting a structured daily check-in for a clinical trial participant. Use brief, collaborative language consistent with motivational interviewing and self-efficacy support (acknowledge effort; ask one thing at a time; no judgment).
+Patient: ${patient.name}, program day ${programDay} (week ${programWeek}), Drug: ${patient.drug}.
 Self-reported weight ${currentWeight} lbs; weekly PA minutes so far ${weeklyPaMins} / ${weeklyPaGoal}.
 Conduct a brief, empathetic check-in. Ask ONE question at a time about:
 1. Hunger/appetite (1-10 scale)
@@ -323,7 +904,31 @@ Conduct a brief, empathetic check-in. Ask ONE question at a time about:
 3. Mood and energy
 4. Medication adherence
 5. Any concerns
-Keep each question short. After 5 exchanges, summarize the check-in data in a JSON block like: [CHECKIN_DATA: {...}]`,
+Keep each question short. After 5 exchanges, summarize the check-in data in a JSON block like: [CHECKIN_DATA: {...}]`;
+
+  const checkinBaseline = `You are ObesityCare AI conducting a structured daily check-in for a clinical trial participant. Be polite and efficient. Do not use motivational interviewing, self-efficacy, or other named behavior-change approaches.
+Patient: ${patient.name}, program day ${programDay} (week ${programWeek}), Drug: ${patient.drug}.
+Self-reported weight ${currentWeight} lbs; weekly PA minutes so far ${weeklyPaMins} / ${weeklyPaGoal}.
+Ask ONE question at a time about:
+1. Hunger/appetite (1-10 scale)
+2. Side effects (nausea, fatigue, injection site reactions)
+3. Mood and energy
+4. Medication adherence
+5. Any concerns
+Keep each question short. After 5 exchanges, summarize the check-in data in a JSON block like: [CHECKIN_DATA: {...}]`;
+
+  const educationTrained = `You are ObesityCare AI, an educational assistant specializing in obesity medicine, GLP-1 therapy, nutrition, and lifestyle modification. Prefer clear, evidence-based statements; when citing mechanisms or guidelines, speak at a population level and avoid overstating certainty. When discussing behavior change, you may briefly reference well-supported ideas (e.g., realistic action planning, building self-efficacy through small successes) without claiming individualized treatment.
+The participant is on program day ${programDay} of ${totalProgramDays}. Keep responses to 3-5 sentences unless the user asks for more detail.
+Always end with an invitation to ask a follow-up question.`;
+
+  const educationBaseline = `You are ObesityCare AI, an educational assistant for obesity medicine, GLP-1 therapy, nutrition, and lifestyle topics. Give clear, factual answers at a general population level. Do not frame answers using behavior-change theory, self-efficacy, or named coaching models unless the participant asks.
+The participant is on program day ${programDay} of ${totalProgramDays}. Keep responses to 3-5 sentences unless the user asks for more detail.
+Always end with an invitation to ask a follow-up question.`;
+
+  return {
+  chat: withTheory ? chatTrained : chatBaseline,
+
+  checkin: withTheory ? checkinTrained : checkinBaseline,
 
   eligibility: `You are ObesityCare AI screening a patient for trial eligibility.
 Current trial: STEP-OB-24 (Semaglutide extended therapy)
@@ -331,92 +936,9 @@ Inclusion criteria: BMI ≥ 30 (or ≥ 27 with comorbidity), age 18-70, no prior
 Exclusion criteria: pregnancy, severe renal impairment, personal/family history of MTC, pancreatitis history, active eating disorder.
 Ask ONE screening question at a time. Be clinical but friendly. After collecting enough info, give a clear ELIGIBLE / POTENTIALLY ELIGIBLE / NOT ELIGIBLE verdict with reasoning. Never give a definitive medical clearance — always say the care team will review.`,
 
-  education: `You are ObesityCare AI, an educational assistant specializing in obesity medicine, GLP-1 therapy, nutrition, and lifestyle modification. Prefer clear, evidence-based statements; when citing mechanisms or guidelines, speak at a population level and avoid overstating certainty. When discussing behavior change, you may briefly reference well-supported ideas (e.g., realistic action planning, building self-efficacy through small successes) without claiming individualized treatment.
-The participant is on program day ${programDay} of ${TOTAL_PROGRAM_DAYS}. Keep responses to 3-5 sentences unless the user asks for more detail.
-Always end with an invitation to ask a follow-up question.`,
-
-  // ── Study instruments: inst1 active; uncomment inst2–inst7 in SYSTEMS + modules + TABS + UI below ──
-  inst1: `You are ObesityCare AI, administering a structured research questionnaire in a chat interface (not a formal diagnosis).
-
-CONTEXT
-- Participant: ${PATIENT.name}
-- Trial: ${PATIENT.trial}
-- Treatment context: ${PATIENT.drug}, program day ${programDay} (week ${programWeek} of ${PATIENT.totalWeeks})
-
-INSTRUMENT ID (replace with your IRB / protocol name): Demographic Information.
-
-ADMINISTRATION RULES
-- Follow the numbered items below in order. Ask ONE item per message. Do not bundle multiple questions.
-- When an item has response options, present them exactly as listed after you ask the question.
-- If the user answers in their own words, map to the closest allowed option; if unclear, ask one short clarifying question.
-- For the income item, accept a number or range; if they are unsure, offer "Prefer not to answer" only if your protocol allows.
-- If the user skips a question, record "skipped" or "declined" only if allowed by protocol; otherwise explain once why the item matters and ask again.
-- Stay neutral, respectful, and non-judgmental. Do not express surprise or opinions about answers.
-
-SKIP LOGIC
-- None unless you add protocol-specific rules here (e.g. "If answer to Q1 is X, skip Q3").
-
-SCORING
-- Categorical / descriptive only unless you add a scoring key: (e.g. "Sum items 2–5; higher = ...")
-
-WHEN ALL ITEMS ARE COMPLETE
-- Thank the participant briefly.
-- Output one final line with a JSON object inside a tag, for research staff to copy, e.g.:
-  [INSTRUMENT_DATA: {"q1_gender":"", "q2_household_income":"", "q3_ethnicity":"", "q4_race":"", "q5_education":"", "q6_marital_status":"", "q7_employment":""}]
-- Use the exact keys above; fill string values from the conversation.
-
-SAFETY
-- If the user expresses self-harm, harm to others, severe distress, or urgent medical crisis, respond with empathy and include [ESCALATE] so the care team can follow up.
-- Never diagnose, prescribe, or change medications; defer clinical decisions to the care team.
-
-INSTRUMENT ITEMS (ask in this order)
-1. What is your gender?
-Female
-Male
-
-2. Please estimate your household's current annual income.
-________________
-
-3. What is your ethnicity?
-Hispanic or Latino
-Not Hispanic or Latino
-
-4. What is your race?
-American Indian or Alaska Native
-Asian
-Black or African American
-Native Hawaiian or Other Pacific Islander
-White
-More than one race
-
-5. Please indicate the highest level of education you have completed.
-Grammar School
-High School or equivalent
-Vocational/Technical School (2 year)
-Some College
-College Graduate (4 year)
-Master's Degree (MS)
-Doctoral Degree (PhD)
-Professional Degree (MD, JD, etc.)
-Other
-
-6. What is your current marital status?
-Divorced
-Living with partner
-Married
-Separated
-Single
-Widowed
-
-7. What is your employment status?
-Full Time
-Part Time
-Retired
-Unemployed`,
+  education: withTheory ? educationTrained : educationBaseline,
   };
 }
-
-// inst2–inst7: add keys to buildSystems return, enable TABS + InstrumentModule2–7 when ready.
 
 function patientInitials(name) {
   const p = String(name).trim().split(/\s+/).filter(Boolean);
@@ -483,33 +1005,68 @@ function TypingDots() {
 }
 
 // ─── Chat Engine ──────────────────────────────────────────────
-function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro, persistInstrument }) {
-  const [messages, setMessages] = useState(intro ? [{ role: "assistant", content: intro }] : []);
+function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro, persistInstrument, conversationKey, conversationLabel, conversationMeta, patient }) {
+  const initialMessages = useMemo(() => {
+    if (conversationKey) {
+      const saved = readConvStore()[conversationKey]?.messages;
+      if (saved && saved.length > 0) return saved;
+    }
+    return intro ? [{ role: "assistant", content: intro, ts: new Date().toISOString() }] : [];
+  }, [conversationKey]); // remount when profile/condition key changes
+
+  const [messages, setMessages] = useState(initialMessages);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
 
   useEffect(() => {
+    setMessages(initialMessages);
+  }, [initialMessages]);
+
+  useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
+
+  const persistConv = useCallback((msgs) => {
+    if (!conversationKey || !conversationMeta) return;
+    saveConversation(
+      conversationKey,
+      conversationMeta.moduleId,
+      conversationLabel ?? conversationMeta.moduleId,
+      msgs,
+      conversationMeta,
+    );
+  }, [conversationKey, conversationLabel, conversationMeta]);
+
+  const newSession = useCallback(() => {
+    if (loading) return;
+    const freshIntro = intro ? [{ role: "assistant", content: intro, ts: new Date().toISOString() }] : [];
+    if (conversationKey) clearConversation(conversationKey);
+    setMessages(freshIntro);
+    setInput("");
+  }, [loading, intro, conversationKey]);
 
   const send = useCallback(async (text) => {
     const userMsg = text.trim();
     if (!userMsg || loading) return;
     setInput("");
-    const newMessages = [...messages, { role: "user", content: userMsg }];
-    setMessages([...newMessages, { role: "assistant", content: "" }]);
+    const userEntry = { role: "user", content: userMsg, ts: new Date().toISOString() };
+    const newMessages = [...messages, userEntry];
+    const withPlaceholder = [...newMessages, { role: "assistant", content: "", ts: new Date().toISOString() }];
+    setMessages(withPlaceholder);
     setLoading(true);
 
-    const apiMessages = newMessages.map(m => ({ role: m.role, content: m.content }));
+    const apiMessages = newMessages.slice(-8).map(m => ({ role: m.role, content: m.content }));
     let finalText = "";
+    let finalMsgs = withPlaceholder;
     try {
       await callGroq(apiMessages, systems[systemKey], (chunk) => {
         finalText = chunk;
         setMessages(prev => {
           const updated = [...prev];
-          updated[updated.length - 1] = { role: "assistant", content: chunk };
+          updated[updated.length - 1] = { ...updated[updated.length - 1], content: chunk };
+          finalMsgs = updated;
           return updated;
         });
       });
@@ -521,6 +1078,9 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
             instrumentKey: persistInstrument.key,
             instrumentLabel: persistInstrument.label ?? persistInstrument.key,
             responses: parsed,
+            patient: patient ?? { id: conversationMeta?.profileId, name: conversationMeta?.profileName },
+            condition: conversationMeta?.condition,
+            conditionLabel: conversationMeta?.conditionLabel,
           });
           const sheetNote = GOOGLE_SHEETS_WEBAPP_URL
             ? "\n\n✓ Responses saved in this browser and sent to the research Google Sheet (if the web app is deployed)."
@@ -531,6 +1091,7 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
             if (last?.role === "assistant") {
               updated[updated.length - 1] = { ...last, content: last.content + sheetNote };
             }
+            finalMsgs = updated;
             return updated;
           });
         }
@@ -545,12 +1106,14 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
       if (errMsg.includes("Failed to fetch") || errMsg.includes("NetworkError")) friendlyMsg = "⚠️ Network error: Could not reach Groq API. Check your internet connection.";
       setMessages(prev => {
         const updated = [...prev];
-        updated[updated.length - 1] = { role: "assistant", content: friendlyMsg };
+        updated[updated.length - 1] = { ...updated[updated.length - 1], content: friendlyMsg };
+        finalMsgs = updated;
         return updated;
       });
     }
     setLoading(false);
-  }, [messages, loading, systemKey, systems, persistInstrument]);
+    persistConv(finalMsgs);
+  }, [messages, loading, systemKey, systems, persistInstrument, persistConv, patient, conversationMeta]);
 
   const handleKey = (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); }
@@ -562,7 +1125,7 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
         {messages.map((m, i) => (
           <div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start", flexDirection: m.role === "user" ? "row-reverse" : "row", maxWidth: "90%", alignSelf: m.role === "user" ? "flex-end" : "flex-start" }}>
             <Avatar
-              initials={m.role === "user" ? patientInitials(PATIENT.name) : "AI"}
+              initials={m.role === "user" ? patientInitials(patient?.name ?? "User") : "AI"}
               color={m.role === "user" ? T.chatUserAvatarFg : T.chatAiAvatarFg}
               bg={m.role === "user" ? T.chatUserAvatarBg : T.chatAiAvatarBg}
               size={30}
@@ -613,82 +1176,130 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
         </div>
       )}
 
-      <div style={{ padding: "10px 20px 16px", borderTop: `1px solid ${T.gray200}`, display: "flex", gap: 8, alignItems: "flex-end" }}>
-        <textarea
-          ref={inputRef}
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          onKeyDown={handleKey}
-          placeholder={placeholder}
-          rows={1}
-          style={{
-            flex: 1, resize: "none", border: `1px solid ${T.gray300}`, borderRadius: 12,
-            padding: "9px 14px", fontSize: 13.5, fontFamily: "'DM Sans', sans-serif",
-            color: T.gray800, outline: "none", lineHeight: 1.5, maxHeight: 80,
-            background: "#fff", transition: "border .15s"
-          }}
-          onFocus={e => e.target.style.borderColor = T.teal}
-          onBlur={e => e.target.style.borderColor = T.gray300}
-        />
-        <button onClick={() => send(input)} disabled={loading || !input.trim()} style={{
-          width: 38, height: 38, borderRadius: "50%", border: "none",
-          background: loading || !input.trim() ? T.gray300 : T.teal,
-          cursor: loading || !input.trim() ? "not-allowed" : "pointer",
-          display: "flex", alignItems: "center", justifyContent: "center",
-          transition: "background .15s", flexShrink: 0
-        }}>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" />
-          </svg>
-        </button>
+      <div style={{ padding: "10px 20px 16px", borderTop: `1px solid ${T.gray200}`, display: "flex", flexDirection: "column", gap: 8 }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={handleKey}
+            placeholder={placeholder}
+            rows={1}
+            style={{
+              flex: 1, resize: "none", border: `1px solid ${T.gray300}`, borderRadius: 12,
+              padding: "9px 14px", fontSize: 13.5, fontFamily: "'DM Sans', sans-serif",
+              color: T.gray800, outline: "none", lineHeight: 1.5, maxHeight: 80,
+              background: "#fff", transition: "border .15s"
+            }}
+            onFocus={e => e.target.style.borderColor = T.teal}
+            onBlur={e => e.target.style.borderColor = T.gray300}
+          />
+          <button onClick={() => send(input)} disabled={loading || !input.trim()} style={{
+            width: 38, height: 38, borderRadius: "50%", border: "none",
+            background: loading || !input.trim() ? T.gray300 : T.teal,
+            cursor: loading || !input.trim() ? "not-allowed" : "pointer",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            transition: "background .15s", flexShrink: 0
+          }}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" />
+            </svg>
+          </button>
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          <button
+            type="button"
+            onClick={() => {
+              if (messages.length <= 1) return;
+              if (!window.confirm("Start a new session? The current chat will be cleared from this browser. Export from My Progress first if you need to keep it.")) return;
+              newSession();
+            }}
+            disabled={loading}
+            style={{
+              fontFamily: "'DM Sans', sans-serif", fontSize: 11.5, fontWeight: 500,
+              padding: "4px 12px", borderRadius: 6,
+              border: `1px solid ${T.gray300}`, background: "#fff",
+              color: T.gray500, cursor: loading ? "not-allowed" : "pointer",
+              opacity: loading ? 0.5 : 1, transition: "all .15s",
+            }}
+            onMouseOver={e => { if (!loading) { e.currentTarget.style.borderColor = T.red; e.currentTarget.style.color = T.red; } }}
+            onMouseOut={e => { e.currentTarget.style.borderColor = T.gray300; e.currentTarget.style.color = T.gray500; }}
+          >
+            ↺ New session
+          </button>
+        </div>
       </div>
     </div>
   );
 }
 
+function buildConvProps(moduleId, moduleLabel, patient, conditionId, conditionLabel) {
+  const conversationKey = makeConversationKey(moduleId, patient.id, conditionId);
+  return {
+    conversationKey,
+    conversationLabel: moduleLabel,
+    conversationMeta: {
+      moduleId,
+      profileId: patient.id,
+      profileName: patient.name,
+      condition: conditionId,
+      conditionLabel,
+    },
+    patient,
+  };
+}
+
 // ─── Modules ──────────────────────────────────────────────────
-function ChatModule({ systems, programDay, programWeek }) {
+function ChatModule({ systems, patient, programDay, programWeek, conditionId, conditionLabel }) {
+  const conv = buildConvProps("chat", "PA Coach", patient, conditionId, conditionLabel);
   return (
     <ChatEngine
-      key={`chat-d${programDay}`}
+      key={conv.conversationKey}
       systems={systems}
       systemKey="chat"
       placeholder="Ask about activity goals, barriers, motivation, or your treatment..."
-      intro={`Hello ${PATIENT.name}! I'm your Confident Moves PA coach. I'm here to help you build a sustainable, personalized physical activity routine that works with your body and your life.\n\nToday is program day ${programDay} (week ${programWeek}) — every step counts. We can work on setting goals, finding activities you enjoy, or problem-solving barriers like ${PATIENT.pa.topBarrier}.\n\nWhat's on your mind today?`}
+      intro={`Hello ${patient.name}! I'm your Confident Moves PA coach. I'm here to help you build a sustainable, personalized physical activity routine that works with your body and your life.\n\nToday is program day ${programDay} (week ${programWeek}) — every step counts. We can work on setting goals, finding activities you enjoy, or problem-solving barriers like ${patient.pa.topBarrier}.\n\nWhat's on your mind today?`}
       quickReplies={["Help me set a PA goal", "I'm struggling to stay motivated", "What activity suits my fitness level?", "How does exercise help with my weight loss?", "Had some side effects this week"]}
+      {...conv}
     />
   );
 }
 
-function CheckInModule({ systems, programDay, programWeek }) {
+function CheckInModule({ systems, patient, programDay, programWeek, conditionId, conditionLabel }) {
+  const conv = buildConvProps("checkin", "Daily Check-in", patient, conditionId, conditionLabel);
   return (
     <ChatEngine
-      key={`checkin-d${programDay}`}
+      key={conv.conversationKey}
       systems={systems}
       systemKey="checkin"
       placeholder="Answer today's check-in questions..."
-      intro={`Good morning ${PATIENT.name}! Time for your program day ${programDay} check-in (week ${programWeek}) — it takes about 2 minutes and helps your care team track your whole-person progress.\n\nI'll ask a few short questions covering activity, energy, appetite, and how you're feeling. Let's start: On a scale of 1–10, how would you rate your hunger and appetite today compared to before you started the program?`}
+      intro={`Good morning ${patient.name}! Time for your program day ${programDay} check-in (week ${programWeek}) — it takes about 2 minutes and helps your care team track your whole-person progress.\n\nI'll ask a few short questions covering activity, energy, appetite, and how you're feeling. Let's start: On a scale of 1–10, how would you rate your hunger and appetite today compared to before you started the program?`}
       quickReplies={["1–3 (much less hungry)", "4–6 (somewhat less hungry)", "7–10 (about the same)", "I forgot my medication today"]}
+      {...conv}
     />
   );
 }
 
-function EligibilityModule({ systems }) {
+function EligibilityModule({ systems, patient, conditionId, conditionLabel }) {
+  const conv = buildConvProps("eligibility", "Eligibility Screener", patient, conditionId, conditionLabel);
   return (
     <ChatEngine
+      key={conv.conversationKey}
       systems={systems}
       systemKey="eligibility"
       placeholder="Answer the screening questions..."
       intro={`Welcome to the STEP-OB-24 trial eligibility screener.\n\nThis brief questionnaire helps determine if you may qualify for our extended semaglutide therapy study. This is not a medical assessment — your care team will review and confirm any eligibility decision.\n\nLet's start with the basics: What is your current height and weight? (You can give approximate values)`}
       quickReplies={["I'm 5'6\", 210 lbs", "I'm 5'8\", 230 lbs", "I'm 5'4\", 195 lbs", "I'd rather answer questions one by one"]}
+      {...conv}
     />
   );
 }
 
-function EducationModule({ systems, programDay }) {
+function EducationModule({ systems, patient, programDay, conditionId, conditionLabel }) {
+  const conv = buildConvProps("education", "Learn & Explore", patient, conditionId, conditionLabel);
   return (
     <ChatEngine
-      key={`edu-d${programDay}`}
+      key={conv.conversationKey}
       systems={systems}
       systemKey="education"
       placeholder="Ask about physical activity, nutrition, your treatment, or obesity medicine..."
@@ -700,92 +1311,239 @@ function EducationModule({ systems, programDay }) {
         "Why does motivation fluctuate?",
         "How does PA help beyond weight loss?",
       ]}
+      {...conv}
     />
   );
 }
 
-function InstrumentModule1({ systems }) {
+const fieldInputStyle = {
+  width: "100%", padding: "6px 8px", borderRadius: 6, border: `1px solid ${T.gray300}`,
+  fontSize: 12, fontFamily: "'DM Sans', sans-serif", background: "#fff",
+};
+
+function ProfileEditorForm({ draft, onChange, onSave, onResetOne, onResetAll }) {
+  const set = (path, value) => {
+    const next = JSON.parse(JSON.stringify(draft));
+    if (path === "conditions") next.conditions = String(value).split(",").map(s => s.trim()).filter(Boolean);
+    else if (path === "medications") next.medications = String(value).split(",").map(s => s.trim()).filter(Boolean);
+    else if (path.startsWith("pa.")) next.pa[path.slice(3)] = value;
+    else if (path.startsWith("weight.")) next.weight[path.slice(7)] = Number(value) || value;
+    else if (path.startsWith("bmi.")) next.bmi[path.slice(4)] = Number(value) || value;
+    else next[path] = path === "totalWeeks" || path === "startProgramDay" || path === "adherence" ? Number(value) || 0 : value;
+    onChange(next);
+  };
+
   return (
-    <ChatEngine
-      systems={systems}
-      systemKey="inst1"
-      placeholder="Answer each question as prompted..."
-      intro={`Hi ${PATIENT.name}! This is a brief background survey — it helps the research team understand who is using the Confident Moves program so we can make it better for everyone.\n\nIt takes about 2 minutes and your answers are confidential. I'll ask one question at a time.\n\nReady to start?`}
-      quickReplies={["Yes, let's start", "I have a question first", "What is this survey for?"]}
-      persistInstrument={{ key: "inst1", label: "Demographics" }}
-    />
+    <div style={{ marginTop: 8, padding: "10px", background: "#fff", borderRadius: 8, border: `1px solid ${T.gray200}` }}>
+      <div style={{ fontSize: 11, color: T.gray500, marginBottom: 8, lineHeight: 1.45 }}>
+        Edit fields for <strong>{draft.name}</strong> ({draft.id}). Saved to this browser.
+      </div>
+      <div style={{ display: "grid", gap: 6, maxHeight: 280, overflowY: "auto" }}>
+        {[
+          ["name", "Name", draft.name, "text"],
+          ["trial", "Trial", draft.trial, "text"],
+          ["drug", "Drug", draft.drug, "text"],
+          ["totalWeeks", "Total weeks", draft.totalWeeks, "number"],
+          ["startProgramDay", "Start program day", draft.startProgramDay, "number"],
+          ["weight.baseline", "Weight baseline (lb)", draft.weight.baseline, "number"],
+          ["weight.current", "Weight current (lb)", draft.weight.current, "number"],
+          ["weight.goal", "Weight goal (lb)", draft.weight.goal, "number"],
+          ["bmi.baseline", "BMI baseline", draft.bmi.baseline, "number"],
+          ["bmi.current", "BMI current", draft.bmi.current, "number"],
+          ["conditions", "Conditions (comma-separated)", draft.conditions.join(", "), "text"],
+          ["medications", "Medications (comma-separated)", draft.medications.join(", "), "text"],
+          ["pa.topBarrier", "Top PA barrier", draft.pa.topBarrier, "text"],
+          ["pa.favoriteActivity", "Favorite activity", draft.pa.favoriteActivity, "text"],
+          ["pa.weeklyGoalMins", "Weekly PA goal (min)", draft.pa.weeklyGoalMins, "number"],
+          ["pa.goalDays", "Active days goal / week", draft.pa.goalDays, "number"],
+        ].map(([path, label, val, type]) => (
+          <div key={path}>
+            <label style={{ display: "block", fontSize: 10.5, color: T.gray600, marginBottom: 2 }}>{label}</label>
+            <input type={type} value={val} onChange={e => set(path, e.target.value)} style={fieldInputStyle} />
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
+        <button type="button" onClick={onSave} style={{
+          fontFamily: "'DM Sans', sans-serif", fontWeight: 600, fontSize: 11.5,
+          padding: "6px 10px", borderRadius: 6, border: "none", background: T.teal, color: "#fff", cursor: "pointer",
+        }}>Save profile</button>
+        <button type="button" onClick={onResetOne} style={{
+          fontFamily: "'DM Sans', sans-serif", fontWeight: 600, fontSize: 11.5,
+          padding: "6px 10px", borderRadius: 6, border: `1px solid ${T.amber}`, background: T.amberLight, color: T.amber, cursor: "pointer",
+        }}>Reset to default</button>
+        <button type="button" onClick={onResetAll} style={{
+          fontFamily: "'DM Sans', sans-serif", fontWeight: 600, fontSize: 11.5,
+          padding: "6px 10px", borderRadius: 6, border: `1px solid ${T.gray300}`, background: "#fff", color: T.gray600, cursor: "pointer",
+        }}>Reset all 3 profiles</button>
+      </div>
+    </div>
   );
 }
 
-/*
-function InstrumentModule2() {
+function ResearchSidebarPanel({
+  profiles, activeProfileId, activeCondition, editingProfile, profileDraft,
+  onSelectProfile, onSelectCondition, onToggleEdit, onDraftChange, onSaveProfile, onResetProfile, onResetAllProfiles,
+}) {
+  const activeCond = CONDITIONS.find(c => c.id === activeCondition) ?? CONDITIONS[0];
+  const tabBtn = (active) => ({
+    fontFamily: "'DM Sans', sans-serif", fontWeight: 600, fontSize: 12,
+    padding: "8px 10px", borderRadius: 8, cursor: "pointer", textAlign: "left", width: "100%",
+    background: active ? T.tealLight : T.gray50,
+    border: active ? `1px solid ${T.tealMid}` : `1px solid ${T.gray200}`,
+    color: active ? T.tealDark : T.gray700,
+  });
+
   return (
-    <ChatEngine
-      systemKey="inst2"
-      placeholder="Answer each question as prompted..."
-      intro={`Hi ${PATIENT.name}! This module runs Instrument 2. Replace SYSTEMS.inst2 with your full instrument text, then edit this intro.\n\nWhen you're ready, reply with your first answer or type "start".`}
-      quickReplies={["Start", "I have a question first", "Remind me what this is for"]}
-    />
+    <div style={{
+      padding: "9px 11px 11px", margin: "0 10px 8px", borderRadius: 10,
+      background: T.purpleLight, border: `1px solid ${T.gray300}`,
+    }}>
+      <div style={{ fontSize: 12, fontWeight: 600, color: T.purple, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 6 }}>
+        Research testing
+      </div>
+      <p style={{ fontSize: 11, color: T.gray600, lineHeight: 1.45, marginBottom: 8 }}>
+        A = baseline. B = theory only. C = theory + all 6 instruments in the coaching prompt. Each profile × condition saves a separate chat log.
+      </p>
+
+      <div style={{ fontSize: 11, fontWeight: 600, color: T.gray500, marginBottom: 4 }}>Profile</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
+        {profiles.map(p => (
+          <button key={p.id} type="button" style={tabBtn(p.id === activeProfileId)} onClick={() => onSelectProfile(p.id)}>
+            {p.name} <span style={{ fontWeight: 400, opacity: 0.75 }}>({p.id})</span>
+          </button>
+        ))}
+      </div>
+      <button type="button" onClick={onToggleEdit} style={{
+        ...tabBtn(editingProfile), marginBottom: editingProfile ? 0 : 8, fontSize: 11.5,
+      }}>
+        {editingProfile ? "Hide profile editor" : "Edit active profile…"}
+      </button>
+      {editingProfile && profileDraft && (
+        <ProfileEditorForm
+          draft={profileDraft}
+          onChange={onDraftChange}
+          onSave={onSaveProfile}
+          onResetOne={onResetProfile}
+          onResetAll={onResetAllProfiles}
+        />
+      )}
+
+      <div style={{ fontSize: 11, fontWeight: 600, color: T.gray500, margin: "10px 0 4px" }}>Condition</div>
+      <div style={{ display: "flex", gap: 4, marginBottom: 6 }}>
+        {CONDITIONS.map(c => (
+          <button key={c.id} type="button" onClick={() => onSelectCondition(c.id)} style={{
+            flex: 1, fontFamily: "'DM Sans', sans-serif", fontWeight: 700, fontSize: 13,
+            padding: "8px 0", borderRadius: 8, cursor: "pointer",
+            background: activeCondition === c.id ? T.teal : "#fff",
+            color: activeCondition === c.id ? "#fff" : T.gray700,
+            border: `1px solid ${activeCondition === c.id ? T.teal : T.gray300}`,
+          }}>{c.id}</button>
+        ))}
+      </div>
+      <div style={{ fontSize: 11, color: T.gray600, lineHeight: 1.4 }}>
+        <strong>{activeCond.label}:</strong> {activeCond.description}
+      </div>
+    </div>
   );
 }
 
-function InstrumentModule3() {
+function ConversationCard({ entry, onClear }) {
+  const [expanded, setExpanded] = useState(false);
+  const userCount = entry.messages.filter(m => m.role === "user").length;
+  const aiCount = entry.messages.filter(m => m.role === "assistant").length;
+  const lastUpdated = entry.lastUpdated
+    ? new Date(entry.lastUpdated).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+    : "—";
+  const subtitle = [
+    entry.profileName && `${entry.profileName}`,
+    entry.condition && `Cond ${entry.condition}`,
+    `${userCount} user · ${aiCount} AI`,
+    lastUpdated,
+  ].filter(Boolean).join(" · ");
+
   return (
-    <ChatEngine
-      systemKey="inst3"
-      placeholder="Answer each question as prompted..."
-      intro={`Hi ${PATIENT.name}! This module runs Instrument 3. Replace SYSTEMS.inst3 with your full instrument text, then edit this intro.\n\nWhen you're ready, reply with your first answer or type "start".`}
-      quickReplies={["Start", "I have a question first", "Remind me what this is for"]}
-    />
+    <div style={{ background: "#fff", border: `1px solid ${T.gray200}`, borderRadius: 10, marginBottom: 10, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 14px", cursor: "pointer" }} onClick={() => setExpanded(x => !x)}>
+        <div style={{
+          width: 32, height: 32, borderRadius: 8, background: T.tealLight,
+          display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+        }}>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={T.teal} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+          </svg>
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 13.5, fontWeight: 600, color: T.gray800 }}>{entry.moduleLabel}</div>
+          <div style={{ fontSize: 11.5, color: T.gray500, marginTop: 1 }}>{subtitle}</div>
+        </div>
+        <button
+          type="button"
+          onClick={e => { e.stopPropagation(); onClear(); }}
+          style={{
+            fontFamily: "'DM Sans', sans-serif", fontSize: 11.5, fontWeight: 600,
+            padding: "4px 10px", borderRadius: 6, border: `1px solid ${T.gray300}`,
+            background: "#fff", color: T.gray500, cursor: "pointer", flexShrink: 0,
+          }}
+        >Clear</button>
+        <svg
+          width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={T.gray400} strokeWidth="2.5"
+          strokeLinecap="round" strokeLinejoin="round"
+          style={{ flexShrink: 0, transform: expanded ? "rotate(180deg)" : "none", transition: "transform .2s" }}
+        >
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
+      </div>
+
+      {expanded && (
+        <div style={{ borderTop: `1px solid ${T.gray100}`, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10, maxHeight: 420, overflowY: "auto" }}>
+          {entry.messages.map((m, i) => (
+            <div key={i} style={{
+              display: "flex", gap: 8, alignItems: "flex-start",
+              flexDirection: m.role === "user" ? "row-reverse" : "row",
+              maxWidth: "92%", alignSelf: m.role === "user" ? "flex-end" : "flex-start",
+            }}>
+              <Avatar
+                initials={m.role === "user" ? patientInitials(entry.profileName ?? "User") : "AI"}
+                color={m.role === "user" ? T.chatUserAvatarFg : T.chatAiAvatarFg}
+                bg={m.role === "user" ? T.chatUserAvatarBg : T.chatAiAvatarBg}
+                size={26}
+              />
+              <div>
+                <div style={{
+                  padding: "9px 13px",
+                  borderRadius: m.role === "user" ? "14px 4px 14px 14px" : "4px 14px 14px 14px",
+                  background: m.role === "user" ? T.chatUserBubble : T.chatAiBubble,
+                  border: m.role === "user" ? "1px solid transparent" : `1px solid ${T.chatAiBubbleBorder}`,
+                  color: m.role === "user" ? T.chatUserText : T.chatAiText,
+                  fontSize: 12.5, lineHeight: 1.6, whiteSpace: "pre-wrap",
+                }}>
+                  {m.content || <em style={{ opacity: 0.5 }}>(empty)</em>}
+                </div>
+                {m.ts && (
+                  <div style={{ fontSize: 10, color: T.gray400, marginTop: 2, textAlign: m.role === "user" ? "right" : "left" }}>
+                    {new Date(m.ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
-function InstrumentModule4() {
-  return (
-    <ChatEngine
-      systemKey="inst4"
-      placeholder="Answer each question as prompted..."
-      intro={`Hi ${PATIENT.name}! This module runs Instrument 4. Replace SYSTEMS.inst4 with your full instrument text, then edit this intro.\n\nWhen you're ready, reply with your first answer or type "start".`}
-      quickReplies={["Start", "I have a question first", "Remind me what this is for"]}
-    />
-  );
-}
+function HistoryModule({ exportPrefix = "export" }) {
+  const [convStore, setConvStore] = useState(() => readConvStore());
 
-function InstrumentModule5() {
-  return (
-    <ChatEngine
-      systemKey="inst5"
-      placeholder="Answer each question as prompted..."
-      intro={`Hi ${PATIENT.name}! This module runs Instrument 5. Replace SYSTEMS.inst5 with your full instrument text, then edit this intro.\n\nWhen you're ready, reply with your first answer or type "start".`}
-      quickReplies={["Start", "I have a question first", "Remind me what this is for"]}
-    />
-  );
-}
+  const refreshConvStore = () => setConvStore(readConvStore());
 
-function InstrumentModule6() {
-  return (
-    <ChatEngine
-      systemKey="inst6"
-      placeholder="Answer each question as prompted..."
-      intro={`Hi ${PATIENT.name}! This module runs Instrument 6. Replace SYSTEMS.inst6 with your full instrument text, then edit this intro.\n\nWhen you're ready, reply with your first answer or type "start".`}
-      quickReplies={["Start", "I have a question first", "Remind me what this is for"]}
-    />
-  );
-}
+  const handleClearConv = (conversationKey) => {
+    clearConversation(conversationKey);
+    refreshConvStore();
+  };
 
-function InstrumentModule7() {
-  return (
-    <ChatEngine
-      systemKey="inst7"
-      placeholder="Answer each question as prompted..."
-      intro={`Hi ${PATIENT.name}! This module runs Instrument 7. Replace SYSTEMS.inst7 with your full instrument text, then edit this intro.\n\nWhen you're ready, reply with your first answer or type "start".`}
-      quickReplies={["Start", "I have a question first", "Remind me what this is for"]}
-    />
-  );
-}
-*/
-
-function HistoryModule() {
   const now = new Date();
   const nextA = getNextVisitFromToday(now);
   const nextB = addDays(now, VISIT_OFFSET_DAYS * 2);
@@ -820,25 +1578,72 @@ function HistoryModule() {
   const severityBg = { low: T.tealLight, medium: T.amberLight, high: T.redLight };
 
   const exportLog = readInstrumentLog();
+  const convEntries = Object.values(convStore);
+  const totalConvMsgs = convEntries.reduce((acc, e) => acc + e.messages.length, 0);
+
   const btnBase = {
-    border: "none", cursor: exportLog.length ? "pointer" : "not-allowed", fontFamily: "'DM Sans', sans-serif",
+    border: "none", fontFamily: "'DM Sans', sans-serif",
     fontWeight: 600, fontSize: 12.5, padding: "8px 14px", borderRadius: 8, transition: "opacity .15s",
   };
-  const dlJson = () => {
+
+  const dlInstJson = () => {
     const log = readInstrumentLog();
     if (!log.length) return;
-    const name = `confident-moves-instruments-${PATIENT.id}-${Date.now()}.json`;
-    triggerDownload(name, "application/json", JSON.stringify(log, null, 2));
+    triggerDownload(`confident-moves-instruments-${exportPrefix}-${Date.now()}.json`, "application/json", JSON.stringify(log, null, 2));
   };
-  const dlCsv = () => {
+  const dlInstCsv = () => {
     const log = readInstrumentLog();
     if (!log.length) return;
-    const name = `confident-moves-instruments-${PATIENT.id}-${Date.now()}.csv`;
-    triggerDownload(name, "text/csv;charset=utf-8", instrumentLogToCsv(log));
+    triggerDownload(`confident-moves-instruments-${exportPrefix}-${Date.now()}.csv`, "text/csv;charset=utf-8", instrumentLogToCsv(log));
+  };
+  const dlConvJson = () => {
+    const store = readConvStore();
+    if (!Object.keys(store).length) return;
+    triggerDownload(`confident-moves-conversations-${exportPrefix}-${Date.now()}.json`, "application/json", JSON.stringify(store, null, 2));
+  };
+  const dlConvCsv = () => {
+    const store = readConvStore();
+    if (!Object.keys(store).length) return;
+    triggerDownload(`confident-moves-conversations-${exportPrefix}-${Date.now()}.csv`, "text/csv;charset=utf-8", convStoreToCsv(store));
   };
 
   return (
     <div style={{ padding: 20, overflowY: "auto", height: "100%" }}>
+
+      {/* ── Conversation Logs ── */}
+      <div style={{ marginBottom: 24 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: T.gray500, textTransform: "uppercase", letterSpacing: ".05em", marginBottom: 4 }}>
+          Conversation logs
+        </div>
+        <p style={{ fontSize: 12.5, color: T.gray600, lineHeight: 1.55, marginBottom: 12 }}>
+          Every message is stored per profile × condition × module ({convEntries.length} log{convEntries.length !== 1 ? "s" : ""}, {totalConvMsgs} turns). Expand to compare how the AI responds across profiles and conditions A/B/C.
+        </p>
+
+        {convEntries.length === 0 && (
+          <div style={{ fontSize: 12.5, color: T.gray400, fontStyle: "italic", padding: "12px 0" }}>
+            No conversations stored yet — start chatting in any tab and the logs will appear here.
+          </div>
+        )}
+
+        {convEntries
+          .sort((a, b) => (b.lastUpdated ?? "").localeCompare(a.lastUpdated ?? ""))
+          .map(entry => (
+          <ConversationCard key={entry.conversationKey ?? entry.moduleId} entry={entry} onClear={() => handleClearConv(entry.conversationKey ?? entry.moduleId)} />
+        ))}
+
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
+          <button type="button" disabled={convEntries.length === 0} onClick={dlConvJson} style={{
+            ...btnBase, border: "none", background: T.teal, color: "#fff",
+            cursor: convEntries.length ? "pointer" : "not-allowed", opacity: convEntries.length ? 1 : 0.45,
+          }}>Export conversations JSON</button>
+          <button type="button" disabled={convEntries.length === 0} onClick={dlConvCsv} style={{
+            ...btnBase, background: "#fff", color: T.tealDark, border: `1px solid ${T.teal}`,
+            cursor: convEntries.length ? "pointer" : "not-allowed", opacity: convEntries.length ? 1 : 0.45,
+          }}>Export conversations CSV</button>
+        </div>
+      </div>
+
+      {/* ── Assessment data export ── */}
       <div style={{
         marginBottom: 24, padding: 16, background: "#fff", border: `1px solid ${T.gray200}`, borderRadius: 10,
       }}>
@@ -846,19 +1651,19 @@ function HistoryModule() {
           Assessment data export
         </div>
         <p style={{ fontSize: 12.5, color: T.gray600, lineHeight: 1.55, marginBottom: 14 }}>
-          Download completed instrument submissions stored in this browser ({exportLog.length} record{exportLog.length !== 1 ? "s" : ""}).
-          Data appears after the Demographics chat finishes and includes an <code style={{ fontSize: 11 }}>[INSTRUMENT_DATA: …]</code> line.
+          Legacy instrument JSON exports from earlier sessions ({exportLog.length} record{exportLog.length !== 1 ? "s" : ""}), if any were saved with an <code style={{ fontSize: 11 }}>[INSTRUMENT_DATA: …]</code> tag.
         </p>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
-          <button type="button" disabled={exportLog.length === 0} onClick={dlJson} style={{
-            ...btnBase, background: T.teal, color: "#fff", opacity: exportLog.length ? 1 : 0.45,
+          <button type="button" disabled={exportLog.length === 0} onClick={dlInstJson} style={{
+            ...btnBase, border: "none", background: T.teal, color: "#fff", cursor: exportLog.length ? "pointer" : "not-allowed", opacity: exportLog.length ? 1 : 0.45,
           }}>Download JSON</button>
-          <button type="button" disabled={exportLog.length === 0} onClick={dlCsv} style={{
-            ...btnBase, background: "#fff", color: T.tealDark, border: `1px solid ${T.teal}`, opacity: exportLog.length ? 1 : 0.45,
+          <button type="button" disabled={exportLog.length === 0} onClick={dlInstCsv} style={{
+            ...btnBase, background: "#fff", color: T.tealDark, border: `1px solid ${T.teal}`, cursor: exportLog.length ? "pointer" : "not-allowed", opacity: exportLog.length ? 1 : 0.45,
           }}>Download CSV</button>
         </div>
       </div>
 
+      {/* ── Visit history ── */}
       <div style={{ marginBottom: 20 }}>
         <div style={{ fontSize: 13, fontWeight: 600, color: T.gray500, textTransform: "uppercase", letterSpacing: ".05em", marginBottom: 12 }}>Visit history</div>
         {visits.map((v, i) => (
@@ -888,6 +1693,7 @@ function HistoryModule() {
         ))}
       </div>
 
+      {/* ── Side effect log ── */}
       <div>
         <div style={{ fontSize: 13, fontWeight: 600, color: T.gray500, textTransform: "uppercase", letterSpacing: ".05em", marginBottom: 12 }}>Side effect log</div>
         {sideEffects.map((s, i) => (
@@ -904,27 +1710,76 @@ function HistoryModule() {
 }
 
 // ─── Main App ─────────────────────────────────────────────────
-// Instruments 2–7: uncomment matching rows in TABS, module header, and module content when you enable inst2–inst7 in SYSTEMS + InstrumentModule2–7.
 const TABS = [
   { id: "chat", label: "PA Coach", icon: "🏃" },
   { id: "checkin", label: "Daily Check-in", icon: "✅" },
   { id: "eligibility", label: "Program Eligibility", icon: "🔬" },
   { id: "education", label: "Learn & Explore", icon: "📚" },
-  { id: "inst1", label: "Demographics", icon: "📋" },
-  // { id: "inst2", label: "Assessment 2", icon: "📋" },
-  // { id: "inst3", label: "Assessment 3", icon: "📋" },
-  // { id: "inst4", label: "Assessment 4", icon: "📋" },
-  // { id: "inst5", label: "Assessment 5", icon: "📋" },
-  // { id: "inst6", label: "Assessment 6", icon: "📋" },
-  // { id: "inst7", label: "Assessment 7", icon: "📋" },
   { id: "history", label: "My Progress", icon: "📈" },
 ];
 
-export default function App() {
-  const saved = loadProgramState();
-  const initial = saved ?? defaultProgramState();
+function loadActiveProfileId() {
+  try {
+    const id = localStorage.getItem(ACTIVE_PROFILE_KEY);
+    if (id && DEFAULT_PROFILES.some(p => p.id === id)) return id;
+  } catch {}
+  return DEFAULT_PROFILES[0].id;
+}
 
-  const [activeTab, setActiveTab] = useState("chat");
+function loadActiveCondition() {
+  try {
+    const c = localStorage.getItem(ACTIVE_CONDITION_KEY);
+    if (c && CONDITIONS.some(x => x.id === c)) return c;
+  } catch {}
+  return "A";
+}
+
+function applyProgramStateToReact(setters, state) {
+  setters.setProgramDay(state.programDay);
+  setters.setCurrentWeight(state.currentWeight);
+  setters.setWeekPaMins(state.weekPaMins);
+  setters.setActiveDaysThisWeek(state.activeDaysThisWeek);
+  setters.setLastPaLogProgramDay(state.lastPaLogProgramDay ?? null);
+  setters.setLastActiveMarkProgramDay(state.lastActiveMarkProgramDay ?? null);
+  setters.setDraftWeight(String(state.currentWeight));
+  setters.setDraftTodayPa("");
+}
+
+export default function App() {
+  migrateLegacyProgramState(DEFAULT_PROFILES[0].id);
+
+  const [profiles, setProfiles] = useState(() => readProfiles());
+  const [activeProfileId, setActiveProfileId] = useState(loadActiveProfileId);
+  const [activeCondition, setActiveCondition] = useState(loadActiveCondition);
+  const [editingProfile, setEditingProfile] = useState(false);
+  const [profileDraft, setProfileDraft] = useState(null);
+
+  const patient = useMemo(
+    () => profiles.find(p => p.id === activeProfileId) ?? profiles[0] ?? DEFAULT_PROFILES[0],
+    [profiles, activeProfileId],
+  );
+
+  const conditionMeta = useMemo(
+    () => CONDITIONS.find(c => c.id === activeCondition) ?? CONDITIONS[0],
+    [activeCondition],
+  );
+
+  const totalProgramDays = getTotalProgramDays(patient);
+  const saved = loadProgramState(patient.id, patient);
+  const initial = saved ?? defaultProgramState(patient);
+
+  const [activeTab, setActiveTab] = useState(() => {
+    const saved = localStorage.getItem("confidentMoves_active_tab");
+    if (saved && TABS.some(t => t.id === saved)) return saved;
+    return "chat";
+  });
+
+  useEffect(() => {
+    if (!TABS.some(t => t.id === activeTab)) setActiveTab("chat");
+    else {
+      try { localStorage.setItem("confidentMoves_active_tab", activeTab); } catch {}
+    }
+  }, [activeTab]);
   const [programDay, setProgramDay] = useState(initial.programDay);
   const [currentWeight, setCurrentWeight] = useState(initial.currentWeight);
   const [weekPaMins, setWeekPaMins] = useState(initial.weekPaMins);
@@ -949,13 +1804,24 @@ export default function App() {
     return () => clearInterval(id);
   }, []);
 
-  const programWeek = Math.min(Math.ceil(programDay / 7), PATIENT.totalWeeks);
+  const programWeek = Math.min(Math.ceil(programDay / 7), patient.totalWeeks);
   const prevProgramWeekRef = useRef(programWeek);
+
+  useEffect(() => {
+    if (editingProfile) setProfileDraft(cloneProfiles([patient])[0]);
+  }, [editingProfile, activeProfileId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(ACTIVE_PROFILE_KEY, activeProfileId);
+      localStorage.setItem(ACTIVE_CONDITION_KEY, activeCondition);
+    } catch {}
+  }, [activeProfileId, activeCondition]);
 
   useEffect(() => {
     try {
       localStorage.setItem(
-        PROGRAM_STATE_KEY,
+        programStateKey(activeProfileId),
         JSON.stringify({
           programDay,
           currentWeight,
@@ -968,7 +1834,7 @@ export default function App() {
     } catch (e) {
       console.warn("Program state save failed:", e);
     }
-  }, [programDay, currentWeight, weekPaMins, activeDaysThisWeek, lastPaLogProgramDay, lastActiveMarkProgramDay]);
+  }, [activeProfileId, programDay, currentWeight, weekPaMins, activeDaysThisWeek, lastPaLogProgramDay, lastActiveMarkProgramDay]);
 
   useEffect(() => {
     const prev = prevProgramWeekRef.current;
@@ -987,27 +1853,97 @@ export default function App() {
 
   const runtime = useMemo(() => {
     const w = Number(currentWeight);
-    const weightOk = Number.isFinite(w) && w > 0 ? w : PATIENT.weight.current;
+    const weightOk = Number.isFinite(w) && w > 0 ? w : patient.weight.current;
     return {
       programDay,
       programWeek,
       currentWeight: weightOk,
-      estBmi: estBmiFromWeight(weightOk),
+      estBmi: estBmiFromWeight(weightOk, patient),
       weeklyPaMins: weekPaMins,
-      weeklyPaGoal: PATIENT.pa.weeklyGoalMins,
+      weeklyPaGoal: patient.pa.weeklyGoalMins,
       activeDaysThisWeek,
-      activeDaysGoal: PATIENT.pa.goalDays,
+      activeDaysGoal: patient.pa.goalDays,
     };
-  }, [programDay, programWeek, currentWeight, weekPaMins, activeDaysThisWeek]);
+  }, [programDay, programWeek, currentWeight, weekPaMins, activeDaysThisWeek, patient]);
 
-  const systems = useMemo(() => buildSystems(runtime), [runtime]);
+  const systems = useMemo(
+    () => applyConditionToSystems(buildSystems(runtime, patient, activeCondition), activeCondition),
+    [runtime, patient, activeCondition],
+  );
 
-  const weightLoss = Math.max(0, PATIENT.weight.baseline - currentWeight);
-  const toGoal = PATIENT.weight.baseline - PATIENT.weight.goal;
+  const moduleProps = useMemo(() => ({
+    systems,
+    patient,
+    programDay,
+    programWeek,
+    conditionId: activeCondition,
+    conditionLabel: conditionMeta.label,
+  }), [systems, patient, programDay, programWeek, activeCondition, conditionMeta.label]);
+
+  const weightLoss = Math.max(0, patient.weight.baseline - currentWeight);
+  const toGoal = patient.weight.baseline - patient.weight.goal;
   const weightGoalPct = toGoal > 0 ? Math.min(100, Math.round((weightLoss / toGoal) * 100)) : 0;
-  const trialPct = Math.min(100, Math.round((programDay / TOTAL_PROGRAM_DAYS) * 100));
-  const paPct = Math.min(100, Math.round((weekPaMins / PATIENT.pa.weeklyGoalMins) * 100));
-  const activeDaysPct = Math.min(100, Math.round((activeDaysThisWeek / PATIENT.pa.goalDays) * 100));
+  const trialPct = Math.min(100, Math.round((programDay / totalProgramDays) * 100));
+  const paPct = Math.min(100, Math.round((weekPaMins / patient.pa.weeklyGoalMins) * 100));
+  const activeDaysPct = Math.min(100, Math.round((activeDaysThisWeek / patient.pa.goalDays) * 100));
+
+  const loadProfileProgramState = useCallback((profile) => {
+    const st = loadProgramState(profile.id, profile) ?? defaultProgramState(profile);
+    applyProgramStateToReact(
+      { setProgramDay, setCurrentWeight, setWeekPaMins, setActiveDaysThisWeek, setLastPaLogProgramDay, setLastActiveMarkProgramDay, setDraftWeight, setDraftTodayPa },
+      st,
+    );
+    prevProgramWeekRef.current = Math.min(Math.ceil(st.programDay / 7), profile.totalWeeks);
+  }, []);
+
+  const handleSelectProfile = (profileId) => {
+    if (profileId === activeProfileId) return;
+    const next = profiles.find(p => p.id === profileId);
+    if (!next) return;
+    if (!window.confirm(`Switch to ${next.name}? This profile's saved program day and chats are kept separately.`)) return;
+    setActiveProfileId(profileId);
+    loadProfileProgramState(next);
+    setEditingProfile(false);
+  };
+
+  const handleSelectCondition = (conditionId) => {
+    setActiveCondition(conditionId);
+  };
+
+  const handleSaveProfile = () => {
+    if (!profileDraft) return;
+    const updated = profiles.map(p => (p.id === profileDraft.id ? profileDraft : p));
+    setProfiles(updated);
+    writeProfiles(updated);
+    if (profileDraft.id === activeProfileId) {
+      const st = loadProgramState(profileDraft.id, profileDraft) ?? defaultProgramState(profileDraft);
+      applyProgramStateToReact(
+        { setProgramDay, setCurrentWeight, setWeekPaMins, setActiveDaysThisWeek, setLastPaLogProgramDay, setLastActiveMarkProgramDay, setDraftWeight, setDraftTodayPa },
+        st,
+      );
+    }
+    setEditingProfile(false);
+    setProfileDraft(null);
+  };
+
+  const handleResetProfile = () => {
+    const def = DEFAULT_PROFILES.find(p => p.id === activeProfileId);
+    if (!def || !window.confirm(`Reset ${def.name} to factory defaults?`)) return;
+    const updated = profiles.map(p => (p.id === def.id ? cloneProfiles([def])[0] : p));
+    setProfiles(updated);
+    writeProfiles(updated);
+    setProfileDraft(cloneProfiles([def])[0]);
+    if (activeProfileId === def.id) loadProfileProgramState(def);
+  };
+
+  const handleResetAllProfiles = () => {
+    if (!window.confirm("Reset all 3 profiles to factory defaults?")) return;
+    const fresh = cloneProfiles(DEFAULT_PROFILES);
+    setProfiles(fresh);
+    writeProfiles(fresh);
+    setProfileDraft(cloneProfiles([fresh.find(p => p.id === activeProfileId) ?? fresh[0]])[0]);
+    loadProfileProgramState(fresh.find(p => p.id === activeProfileId) ?? fresh[0]);
+  };
 
   const applySelfReport = () => {
     const w = Number(draftWeight);
@@ -1027,23 +1963,19 @@ export default function App() {
   };
 
   const goNextProgramDay = () => {
-    setProgramDay((d) => Math.min(d + 1, TOTAL_PROGRAM_DAYS));
+    setProgramDay((d) => Math.min(d + 1, totalProgramDays));
   };
 
   const resetProgramStart = () => {
-    const d = defaultProgramState();
-    setProgramDay(d.programDay);
-    setCurrentWeight(d.currentWeight);
-    setWeekPaMins(d.weekPaMins);
-    setActiveDaysThisWeek(d.activeDaysThisWeek);
-    setLastPaLogProgramDay(d.lastPaLogProgramDay);
-    setLastActiveMarkProgramDay(d.lastActiveMarkProgramDay);
-    setDraftWeight(String(d.currentWeight));
-    setDraftTodayPa("");
-    prevProgramWeekRef.current = 1;
+    const d = defaultProgramState(patient);
+    applyProgramStateToReact(
+      { setProgramDay, setCurrentWeight, setWeekPaMins, setActiveDaysThisWeek, setLastPaLogProgramDay, setLastActiveMarkProgramDay, setDraftWeight, setDraftTodayPa },
+      d,
+    );
+    prevProgramWeekRef.current = Math.min(Math.ceil(d.programDay / 7), patient.totalWeeks);
   };
 
-  const initials = patientInitials(PATIENT.name);
+  const initials = patientInitials(patient.name);
 
   return (
     <div style={{ fontFamily: "'DM Sans', 'Helvetica Neue', sans-serif", background: T.gray50, flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
@@ -1073,12 +2005,13 @@ export default function App() {
         </div>
 
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <Badge children={`${PATIENT.trial}`} color={T.purple} bg={T.purpleLight} />
-          <Badge children={`Day ${programDay} / ${TOTAL_PROGRAM_DAYS}`} color={T.tealDark} bg={T.tealLight} />
-          <Badge children={`Week ${programWeek}/${PATIENT.totalWeeks}`} color={T.teal} bg={T.tealLight} />
+          <Badge children={`${patient.trial}`} color={T.purple} bg={T.purpleLight} />
+          <Badge children={`Condition ${activeCondition}`} color={T.purple} bg={T.purpleLight} />
+          <Badge children={`Day ${programDay} / ${totalProgramDays}`} color={T.tealDark} bg={T.tealLight} />
+          <Badge children={`Week ${programWeek}/${patient.totalWeeks}`} color={T.teal} bg={T.tealLight} />
           <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 12px", border: `1px solid ${T.gray200}`, borderRadius: 20, background: T.gray50 }}>
             <Avatar initials={initials} size={22} />
-            <span style={{ fontSize: 12, fontWeight: 500, color: T.gray700 }}>{PATIENT.name}</span>
+            <span style={{ fontSize: 12, fontWeight: 500, color: T.gray700 }}>{patient.name}</span>
           </div>
         </div>
       </div>
@@ -1100,6 +2033,21 @@ export default function App() {
           <div style={{ padding: "11px 14px 8px" }}>
             <div style={{ fontSize: 12.5, fontWeight: 600, color: T.gray500, textTransform: "uppercase", letterSpacing: ".06em" }}>My Journey</div>
           </div>
+
+          <ResearchSidebarPanel
+            profiles={profiles}
+            activeProfileId={activeProfileId}
+            activeCondition={activeCondition}
+            editingProfile={editingProfile}
+            profileDraft={profileDraft}
+            onSelectProfile={handleSelectProfile}
+            onSelectCondition={handleSelectCondition}
+            onToggleEdit={() => setEditingProfile(x => !x)}
+            onDraftChange={setProfileDraft}
+            onSaveProfile={handleSaveProfile}
+            onResetProfile={handleResetProfile}
+            onResetAllProfiles={handleResetAllProfiles}
+          />
 
           <div style={{
             padding: "9px 11px 11px",
@@ -1152,10 +2100,10 @@ export default function App() {
               }}>{lastActiveMarkProgramDay === programDay ? "Active ✓" : "+ Active day"}</button>
             </div>
             <div style={{ display: "flex", gap: 6 }}>
-              <button type="button" onClick={goNextProgramDay} disabled={programDay >= TOTAL_PROGRAM_DAYS} style={{
+              <button type="button" onClick={goNextProgramDay} disabled={programDay >= totalProgramDays} style={{
                 flex: 1, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, fontSize: 11.5,
                 padding: "7px 7px", borderRadius: 8, border: `1px solid ${T.gray300}`, background: "#fff", color: T.gray800,
-                cursor: programDay >= TOTAL_PROGRAM_DAYS ? "not-allowed" : "pointer",
+                cursor: programDay >= totalProgramDays ? "not-allowed" : "pointer",
               }}>Next day</button>
               <button type="button" onClick={resetProgramStart} style={{
                 flex: 1, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, fontSize: 11.5,
@@ -1194,12 +2142,12 @@ export default function App() {
           <div style={{ padding: "13px 11px", borderTop: `1px solid ${T.gray200}`, background: "#fff" }}>
             <div style={{ fontSize: 12, fontWeight: 600, color: T.gray500, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 8 }}>My Goals</div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-              <MetricCard label="Weekly PA" value={`${weekPaMins}/${PATIENT.pa.weeklyGoalMins}′`} sub={`${paPct}%`} progress={paPct} compact sidebar />
-              <MetricCard label="Active days" value={`${activeDaysThisWeek}/${PATIENT.pa.goalDays}`} sub="week" progress={activeDaysPct} compact sidebar />
+              <MetricCard label="Weekly PA" value={`${weekPaMins}/${patient.pa.weeklyGoalMins}′`} sub={`${paPct}%`} progress={paPct} compact sidebar />
+              <MetricCard label="Active days" value={`${activeDaysThisWeek}/${patient.pa.goalDays}`} sub="week" progress={activeDaysPct} compact sidebar />
               <MetricCard
                 label="Weight lost"
                 value={`−${weightLoss} lbs`}
-                sub={`${weightGoalPct}% · BMI ${estBmiFromWeight(currentWeight)}`}
+                sub={`${weightGoalPct}% · BMI ${estBmiFromWeight(currentWeight, patient)}`}
                 progress={weightGoalPct}
                 color={T.amber}
                 compact
@@ -1218,7 +2166,7 @@ export default function App() {
                   ({VISIT_OFFSET_DAYS} days from today)
                 </span>
               </div>
-              <div style={{ lineHeight: 1.4, fontSize: 12, color: T.gray600 }}>{PATIENT.doctor}</div>
+              <div style={{ lineHeight: 1.4, fontSize: 12, color: T.gray600 }}>{patient.doctor}</div>
             </div>
           </div>
         </div>
@@ -1235,16 +2183,7 @@ export default function App() {
                 {activeTab === "checkin" && "Daily wellness, activity & medication check-in"}
                 {activeTab === "eligibility" && "Automated program eligibility screening — STEP-OB-24"}
                 {activeTab === "education" && "Evidence-based PA education & obesity medicine"}
-                {activeTab === "inst1" && "Assessment 1 of 7 — Demographic Information Survey"}
-                {/*
-                {activeTab === "inst2" && "Assessment 2 — edit SYSTEMS.inst2 & sidebar label"}
-                {activeTab === "inst3" && "Assessment 3 — edit SYSTEMS.inst3 & sidebar label"}
-                {activeTab === "inst4" && "Assessment 4 — edit SYSTEMS.inst4 & sidebar label"}
-                {activeTab === "inst5" && "Assessment 5 — edit SYSTEMS.inst5 & sidebar label"}
-                {activeTab === "inst6" && "Assessment 6 — edit SYSTEMS.inst6 & sidebar label"}
-                {activeTab === "inst7" && "Assessment 7 — edit SYSTEMS.inst7 & sidebar label"}
-                */}
-                {activeTab === "history" && "Activity log, visit records & health notes"}
+                {activeTab === "history" && "Conversation logs, visit records & health notes"}
               </div>
             </div>
             <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
@@ -1255,20 +2194,11 @@ export default function App() {
 
           {/* Module content */}
           <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
-            {activeTab === "chat" && <ChatModule systems={systems} programDay={programDay} programWeek={programWeek} />}
-            {activeTab === "checkin" && <CheckInModule systems={systems} programDay={programDay} programWeek={programWeek} />}
-            {activeTab === "eligibility" && <EligibilityModule systems={systems} />}
-            {activeTab === "education" && <EducationModule systems={systems} programDay={programDay} />}
-            {activeTab === "inst1" && <InstrumentModule1 systems={systems} />}
-            {/*
-            {activeTab === "inst2" && <InstrumentModule2 />}
-            {activeTab === "inst3" && <InstrumentModule3 />}
-            {activeTab === "inst4" && <InstrumentModule4 />}
-            {activeTab === "inst5" && <InstrumentModule5 />}
-            {activeTab === "inst6" && <InstrumentModule6 />}
-            {activeTab === "inst7" && <InstrumentModule7 />}
-            */}
-            {activeTab === "history" && <HistoryModule />}
+            {activeTab === "chat" && <ChatModule {...moduleProps} />}
+            {activeTab === "checkin" && <CheckInModule {...moduleProps} />}
+            {activeTab === "eligibility" && <EligibilityModule {...moduleProps} />}
+            {activeTab === "education" && <EducationModule {...moduleProps} />}
+            {activeTab === "history" && <HistoryModule exportPrefix="all-profiles" />}
           </div>
         </div>
       </div>

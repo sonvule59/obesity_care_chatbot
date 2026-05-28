@@ -1,0 +1,45 @@
+I've been struggling to stay active this week. I just don't feel motivated and I feel like I'm failing.
+
+─────────────────────────────────────────
+[ chatbot response A1, B1, C1]
+─────────────────────────────────────────
+
+"I want to try but I'm just so tired 
+all the time. By the end of the day 
+I have nothing left."
+
+─────────────────────────────────────────
+[ chatbot response A2, B2, C2]
+─────────────────────────────────────────
+
+"I feel embarrassed exercising in public 
+because of my size. I don't want people 
+looking at me."
+
+─────────────────────────────────────────
+[ chatbot response A3, B3, C3]
+─────────────────────────────────────────
+
+"Maybe I could try something at home. I do a lot of housework anyway."
+
+─────────────────────────────────────────
+[ chatbot response A4, B4, C4]
+─────────────────────────────────────────
+
+"Okay I think I could try walking 
+around the house or doing some 
+cleaning more actively. 
+When should I do it?"
+
+─────────────────────────────────────────
+[ chatbot response A5, B5, C5]
+─────────────────────────────────────────
+
+"Okay let's say Tuesday and Thursday 
+evenings after dinner. 
+For about 10 minutes."
+
+─────────────────────────────────────────
+[ chatbot response A6, B6, C6]
+─────────────────────────────────────────
+
