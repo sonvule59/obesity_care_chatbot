@@ -4,9 +4,41 @@ const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_SECRET_KEY;
 if (!GROQ_API_KEY) {
   throw new Error("VITE_GROQ_API_SECRET_KEY is not set in .env");
 }
-const GROQ_MODEL = import.meta.env.VITE_GROQ_MODEL || "llama-3.3-70b-versatile";
+const GROQ_MODEL = import.meta.env.VITE_GROQ_MODEL || "llama-3.1-8b-instant";
 
-async function callGroq(messages, systemPrompt, onChunk) {
+const API_METRICS_KEY = "confidentMoves_api_metrics";
+const MIN_GROQ_INTERVAL_MS = 2500;
+const ASSESSMENT_GROQ_INTERVAL_MS = 3500;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function readApiMetrics() {
+  try {
+    const raw = localStorage.getItem(API_METRICS_KEY);
+    if (!raw) return { totalCalls: 0, successCalls: 0, rateLimitHits: 0, errors: 0, lastCallAt: null, last429At: null };
+    return { totalCalls: 0, successCalls: 0, rateLimitHits: 0, errors: 0, lastCallAt: null, last429At: null, ...JSON.parse(raw) };
+  } catch {
+    return { totalCalls: 0, successCalls: 0, rateLimitHits: 0, errors: 0, lastCallAt: null, last429At: null };
+  }
+}
+
+function recordApiMetric(event) {
+  try {
+    const m = readApiMetrics();
+    const now = new Date().toISOString();
+    if (event === "call") { m.totalCalls += 1; m.lastCallAt = now; }
+    if (event === "success") { m.successCalls += 1; }
+    if (event === "429") { m.rateLimitHits += 1; m.last429At = now; }
+    if (event === "error") { m.errors += 1; }
+    localStorage.setItem(API_METRICS_KEY, JSON.stringify(m));
+  } catch {}
+}
+
+let lastGroqCallFinishedAt = 0;
+
+async function callGroqOnce(messages, systemPrompt, onChunk, maxTokens = 350) {
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -15,7 +47,7 @@ async function callGroq(messages, systemPrompt, onChunk) {
     },
     body: JSON.stringify({
       model: GROQ_MODEL,
-      max_tokens: 500,
+      max_tokens: maxTokens,
       temperature: 0.3,
       stream: true,
       messages: [
@@ -51,6 +83,38 @@ async function callGroq(messages, systemPrompt, onChunk) {
   return full;
 }
 
+async function callGroq(messages, systemPrompt, onChunk, options = {}) {
+  const minInterval = options.minIntervalMs ?? MIN_GROQ_INTERVAL_MS;
+  const maxTokens = options.maxTokens ?? 350;
+  const maxRetries = options.maxRetries ?? 4;
+
+  const wait = lastGroqCallFinishedAt + minInterval - Date.now();
+  if (wait > 0) await sleep(wait);
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    recordApiMetric("call");
+    try {
+      const full = await callGroqOnce(messages, systemPrompt, onChunk, maxTokens);
+      recordApiMetric("success");
+      lastGroqCallFinishedAt = Date.now();
+      return full;
+    } catch (e) {
+      const errMsg = e?.message || String(e);
+      const is429 = errMsg.includes("429");
+      if (is429) recordApiMetric("429");
+      else recordApiMetric("error");
+
+      if (is429 && attempt < maxRetries) {
+        const backoffMs = 6000 * (attempt + 1);
+        await sleep(backoffMs);
+        continue;
+      }
+      lastGroqCallFinishedAt = Date.now();
+      throw e;
+    }
+  }
+}
+
 const INSTRUMENT_LOG_KEY = "confidentMoves_instrument_log";
 const GOOGLE_SHEETS_WEBAPP_URL = import.meta.env.VITE_GOOGLE_SHEETS_WEBAPP_URL || "";
 
@@ -82,18 +146,49 @@ function csvEscapeCell(v) {
   return s;
 }
 
+// ─── De-identification helper ─────────────────────────────────
+// All exports use participant CODE (PT-0001) not real names.
+function deidentify(record) {
+  return record.participantId ?? record.profileId ?? "UNKNOWN";
+}
+
+// ─── CSV exports (Excel-friendly, flat, de-identified) ────────
+
 function instrumentLogToCsv(log) {
-  const headers = ["submittedAt", "participantId", "participantName", "instrumentKey", "instrumentLabel", "responsesJson"];
+  // One flat row per submission. Numeric scores in separate columns — open in Excel directly.
+  const paseKeys = ["item1","item2","item3","item4","item5","item6"];
+  const serpaExtra = ["item7","item8","item9","item10","item11","item12","item13"];
+  const headers = [
+    "participantCode","condition","conditionLabel","instrumentKey","instrumentLabel","submittedAt",
+    "item1","item2","item3","item4","item5","item6",
+    "item7","item8","item9","item10","item11","item12","item13",
+    "moderate_total","vigorous_total","total_score",
+    "gender","income","ethnicity","race","education","marital_status","employment",
+  ];
   const lines = [headers.join(",")];
   for (const row of log) {
-    const responsesJson = JSON.stringify(row.responses ?? {});
+    const r = row.responses ?? {};
+    const modItems = r.moderate_items ?? {};
+    const vigItems = r.vigorous_items ?? {};
     lines.push([
-      csvEscapeCell(row.submittedAt),
-      csvEscapeCell(row.participantId),
-      csvEscapeCell(row.participantName),
-      csvEscapeCell(row.instrumentKey),
-      csvEscapeCell(row.instrumentLabel),
-      csvEscapeCell(responsesJson),
+      csvEscapeCell(deidentify(row)),
+      csvEscapeCell(row.condition ?? ""),
+      csvEscapeCell(row.conditionLabel ?? ""),
+      csvEscapeCell(row.instrumentKey ?? ""),
+      csvEscapeCell(row.instrumentLabel ?? ""),
+      csvEscapeCell(row.submittedAt ?? ""),
+      ...paseKeys.map(k => csvEscapeCell(r[k] ?? modItems[k] ?? "")),
+      ...serpaExtra.map((k,i) => csvEscapeCell(r[k] ?? vigItems[`item${i+1}`] ?? "")),
+      csvEscapeCell(r.moderate_total ?? ""),
+      csvEscapeCell(r.vigorous_total ?? ""),
+      csvEscapeCell(r.total_score ?? ""),
+      csvEscapeCell(r.gender ?? ""),
+      csvEscapeCell(r.income ?? ""),
+      csvEscapeCell(r.ethnicity ?? ""),
+      csvEscapeCell(r.race ?? ""),
+      csvEscapeCell(r.education ?? ""),
+      csvEscapeCell(r.marital_status ?? ""),
+      csvEscapeCell(r.employment ?? ""),
     ].join(","));
   }
   return lines.join("\r\n");
@@ -123,6 +218,70 @@ function extractInstrumentJson(text) {
   return null;
 }
 
+/** Parse a [QUIZ: {...}] marker from an AI response (balanced-brace JSON).
+ *  Returns { quiz, cleanText } — quiz is null if no marker found. */
+function parseQuizFromMessage(text) {
+  const marker = "[QUIZ:";
+  const i = text.indexOf(marker);
+  if (i === -1) return { quiz: null, cleanText: text };
+  const start = text.indexOf("{", i);
+  if (start === -1) return { quiz: null, cleanText: text };
+  let depth = 0;
+  for (let j = start; j < text.length; j++) {
+    if (text[j] === "{") depth++;
+    else if (text[j] === "}") {
+      depth--;
+      if (depth === 0) {
+        const closeBracket = text.indexOf("]", j);
+        if (closeBracket === -1) return { quiz: null, cleanText: text };
+        try {
+          const quiz = JSON.parse(text.slice(start, j + 1));
+          const tagEnd = closeBracket + 1;
+          const cleanText = (text.slice(0, i) + text.slice(tagEnd)).replace(/\n{3,}/g, "\n\n").trim();
+          return { quiz, cleanText };
+        } catch {
+          return { quiz: null, cleanText: text };
+        }
+      }
+    }
+  }
+  return { quiz: null, cleanText: text };
+}
+
+const DEFAULT_SCALE_QUIZ = {
+  type: "scale",
+  min: 0,
+  max: 4,
+  labels: ["No Confidence", "Low", "Moderate", "High", "Complete Confidence"],
+};
+
+/** If the model forgets [QUIZ:], infer the widget from instrument + question text (assessment mode only). */
+function inferAssessmentQuiz(text, instrumentKey) {
+  if (!instrumentKey || !text?.trim()) return null;
+  const t = text.trim();
+  const lower = t.toLowerCase();
+  if (lower.includes("[instrument_data:") || extractInstrumentJson(t)) return null;
+
+  if (instrumentKey === "inst1") {
+    if (lower.includes("annual income") || lower.includes("household's current")) return null;
+    if (/\bgender\b/.test(lower)) return { type: "choice", options: ["Female", "Male"] };
+    if (/\bethnicity\b/.test(lower)) return { type: "choice", options: ["Hispanic or Latino", "Not Hispanic or Latino"] };
+    if (/\brace\b/.test(lower)) return { type: "choice", options: ["American Indian or Alaska Native", "Asian", "Black or African American", "Native Hawaiian or Other Pacific Islander", "White", "More than one race"] };
+    if (lower.includes("education")) return { type: "choice", options: ["Grammar School", "High School or equivalent", "Vocational/Technical School (2 year)", "Some College", "College Graduate (4 year)", "Master's Degree (MS)", "Doctoral Degree (PhD)", "Professional Degree (MD, JD, etc.)", "Other"] };
+    if (lower.includes("marital")) return { type: "choice", options: ["Divorced", "Living with partner", "Married", "Separated", "Single", "Widowed"] };
+    if (lower.includes("employment")) return { type: "choice", options: ["Full Time", "Part Time", "Retired", "Unemployed"] };
+    return null;
+  }
+
+  if (["inst2", "inst3", "inst4", "inst5", "inst6"].includes(instrumentKey)) {
+    const isConfidenceItem =
+      lower.includes("how confident") ||
+      (/\?\s*$/.test(t) && (lower.includes("next week") || lower.includes("minutes") || lower.includes("when ")));
+    if (isConfidenceItem) return DEFAULT_SCALE_QUIZ;
+  }
+  return null;
+}
+
 async function persistInstrumentSubmission({ instrumentKey, instrumentLabel, responses, patient, condition, conditionLabel }) {
   const record = {
     submittedAt: new Date().toISOString(),
@@ -141,6 +300,8 @@ async function persistInstrumentSubmission({ instrumentKey, instrumentLabel, res
   } catch (e) {
     console.warn("Instrument localStorage log failed:", e);
   }
+  // Also update per-profile score cache so PA Coach can inject scores into prompts.
+  writeProfileScore(patient.id, instrumentKey, responses);
   if (!GOOGLE_SHEETS_WEBAPP_URL) return;
   try {
     await fetch(GOOGLE_SHEETS_WEBAPP_URL, {
@@ -152,6 +313,97 @@ async function persistInstrumentSubmission({ instrumentKey, instrumentLabel, res
   } catch (e) {
     console.warn("Google Sheet POST failed:", e);
   }
+}
+
+// ─── Per-profile instrument score cache ────────────────────────
+// Scores are written here whenever an instrument completes, then
+// injected into the PA Coach system prompt so the AI can personalize
+// coaching based on real collected data (the "real-time learning" mechanism).
+
+function profileScoresKey(profileId) {
+  return `confidentMoves_scores_${profileId}`;
+}
+
+function readProfileScores(profileId) {
+  try {
+    const raw = localStorage.getItem(profileScoresKey(profileId));
+    if (!raw) return {};
+    return JSON.parse(raw) ?? {};
+  } catch { return {}; }
+}
+
+function writeProfileScore(profileId, instrumentKey, responses) {
+  try {
+    const existing = readProfileScores(profileId);
+    existing[instrumentKey] = { ...responses, _savedAt: new Date().toISOString() };
+    localStorage.setItem(profileScoresKey(profileId), JSON.stringify(existing));
+  } catch (e) {
+    console.warn("Profile score cache write failed:", e);
+  }
+}
+
+/** Format collected instrument scores into a concise coaching-context block.
+ *  Injected into the PA Coach system prompt (Conditions B/C) so the AI
+ *  can reference real assessment data when coaching. */
+function buildScoreContextBlock(scores) {
+  if (!scores || Object.keys(scores).length === 0) return "";
+
+  const paseRange = (n) => n <= 8 ? "Low (0–8)" : n <= 16 ? "Moderate (9–16)" : "High (17–24)";
+
+  const serpaItemLabels = [
+    "bad weather", "boredom with available activities", "vacation",
+    "uninterested in available activities", "physical discomfort while active",
+    "exercising alone", "not enjoying available activities",
+    "difficult location access", "not liking available activities",
+    "schedule conflicts", "self-consciousness about appearance",
+    "no encouragement", "personal stress",
+  ];
+
+  const lines = [];
+
+  if (scores.inst1) {
+    const d = scores.inst1;
+    const parts = [d.gender, d.education, d.employment, d.marital_status].filter(Boolean);
+    if (parts.length) lines.push(`Demographics: ${parts.join(", ")}.`);
+  }
+
+  const paseMap = [
+    ["inst2", "J-R PASE (job-related PA SE)"],
+    ["inst3", "T-R PASE (transport PA SE)"],
+    ["inst4", "D-R PASE (domestic PA SE)"],
+  ];
+  for (const [key, label] of paseMap) {
+    if (!scores[key]) continue;
+    const d = scores[key];
+    const tot = d.total_score ?? 0;
+    lines.push(`${label}: ${tot}/24 — ${paseRange(tot)}.`);
+  }
+
+  if (scores.inst5) {
+    const d = scores.inst5;
+    const mt = d.moderate_total ?? 0;
+    const vt = d.vigorous_total ?? 0;
+    lines.push(`L-R PASE (leisure PA SE): moderate ${mt}/24 (${paseRange(mt)}), vigorous ${vt}/24 (${paseRange(vt)}).`);
+  }
+
+  if (scores.inst6) {
+    const d = scores.inst6;
+    const tot = d.total_score ?? 0;
+    const serpaTier = tot <= 17 ? "Low confidence (high barrier burden)" : tot <= 34 ? "Moderate" : "High confidence (low barriers)";
+    const critical = serpaItemLabels
+      .map((name, i) => ({ name, score: d[`item${i + 1}`] ?? 4 }))
+      .filter(x => x.score <= 1)
+      .map(x => x.name);
+    lines.push(`SERPA (barrier SE): ${tot}/52 — ${serpaTier}.${critical.length ? ` Specific barriers (score ≤1): ${critical.join("; ")}.` : ""}`);
+  }
+
+  if (lines.length === 0) return "";
+
+  return `
+
+PATIENT ASSESSMENT DATA — COLLECTED (inject into coaching; do not read raw numbers aloud unless asked):
+${lines.join("\n")}
+→ Coaching focus: personalize around domains with Low SE and named barriers. Use SE theory sources (mastery, affective) and PACE (acceptance, empowerment) to address these specific gaps.`;
 }
 
 // ─── Conversation store ────────────────────────────────────────
@@ -203,26 +455,131 @@ function clearConversation(moduleId) {
 }
 
 function convStoreToCsv(store) {
-  const headers = ["profileId", "profileName", "condition", "conditionLabel", "moduleId", "moduleLabel", "lastUpdated", "turn", "role", "ts", "content"];
+  // One row per turn. participantCode only — no real names in research exports.
+  const headers = ["participantCode","condition","conditionLabel","moduleId","moduleLabel","lastUpdated","turnNumber","role","timestamp","message"];
   const lines = [headers.join(",")];
   for (const entry of Object.values(store)) {
     entry.messages.forEach((msg, idx) => {
       lines.push([
-        csvEscapeCell(entry.profileId),
-        csvEscapeCell(entry.profileName),
-        csvEscapeCell(entry.condition),
-        csvEscapeCell(entry.conditionLabel),
-        csvEscapeCell(entry.moduleId),
-        csvEscapeCell(entry.moduleLabel),
-        csvEscapeCell(entry.lastUpdated),
+        csvEscapeCell(entry.profileId ?? ""),
+        csvEscapeCell(entry.condition ?? ""),
+        csvEscapeCell(entry.conditionLabel ?? ""),
+        csvEscapeCell(entry.moduleId ?? ""),
+        csvEscapeCell(entry.moduleLabel ?? ""),
+        csvEscapeCell(entry.lastUpdated ?? ""),
         csvEscapeCell(idx + 1),
-        csvEscapeCell(msg.role),
+        csvEscapeCell(msg.role ?? ""),
         csvEscapeCell(msg.ts ?? ""),
-        csvEscapeCell(msg.content),
+        csvEscapeCell(msg.content ?? ""),
       ].join(","));
     });
   }
   return lines.join("\r\n");
+}
+
+/** PASE scores summary — one row per participant.
+ *  Non-technical friendly: open in Excel, each score in its own column with plain-English level. */
+function paseScoresSummaryCsv() {
+  const profiles = readProfiles();
+  const paseLevel = n => n == null ? "" : n <= 8 ? "Low" : n <= 16 ? "Moderate" : "High";
+  const serpaLevel = n => n == null ? "" : n <= 17 ? "Low confidence" : n <= 34 ? "Moderate" : "High confidence";
+  const serpaBarrierNames = [
+    "bad weather","boredom","vacation","uninterested","physical discomfort",
+    "alone","don't enjoy activities","location access","don't like activities",
+    "schedule conflicts","self-consciousness","no encouragement","personal stress",
+  ];
+  const headers = [
+    "participantCode",
+    "jrPase_score","jrPase_level",
+    "trPase_score","trPase_level",
+    "drPase_score","drPase_level",
+    "lrPase_moderate_score","lrPase_moderate_level",
+    "lrPase_vigorous_score","lrPase_vigorous_level",
+    "serpa_score","serpa_level","serpa_criticalBarriers",
+    "collectedAt",
+  ];
+  const lines = [headers.join(",")];
+  for (const p of profiles) {
+    const s = readProfileScores(p.id);
+    if (!Object.keys(s).filter(k => !k.startsWith("_")).length) continue;
+    const jr = s.inst2?.total_score ?? null;
+    const tr = s.inst3?.total_score ?? null;
+    const dr = s.inst4?.total_score ?? null;
+    const lrM = s.inst5?.moderate_total ?? null;
+    const lrV = s.inst5?.vigorous_total ?? null;
+    const serp = s.inst6?.total_score ?? null;
+    const critBarriers = serpaBarrierNames
+      .map((name, i) => ({ name, score: s.inst6?.[`item${i+1}`] ?? 4 }))
+      .filter(x => x.score <= 1).map(x => x.name).join("; ");
+    lines.push([
+      csvEscapeCell(p.id),
+      csvEscapeCell(jr ?? ""), csvEscapeCell(paseLevel(jr)),
+      csvEscapeCell(tr ?? ""), csvEscapeCell(paseLevel(tr)),
+      csvEscapeCell(dr ?? ""), csvEscapeCell(paseLevel(dr)),
+      csvEscapeCell(lrM ?? ""), csvEscapeCell(paseLevel(lrM)),
+      csvEscapeCell(lrV ?? ""), csvEscapeCell(paseLevel(lrV)),
+      csvEscapeCell(serp ?? ""), csvEscapeCell(serpaLevel(serp)),
+      csvEscapeCell(critBarriers),
+      csvEscapeCell(s.inst2?._savedAt ?? s.inst6?._savedAt ?? ""),
+    ].join(","));
+  }
+  return lines.join("\r\n");
+}
+
+/** Benchmark CSV — one row per scored AI response.
+ *  Has blank "human_*" columns so coders can fill in scores directly in Excel.
+ *  Export → open in Excel → share with RA → calculate kappa. */
+function benchmarkCsv() {
+  const judgeResults = readJudgeResults();
+  const headers = [
+    "scoredAt","participantCode","condition","module",
+    "llm_total","llm_max",
+    "llm_open_question","llm_affirm","llm_reflect_summary","llm_se_source","llm_bct","llm_personalization",
+    "llm_rationale","responsePreview",
+    "human_open_question","human_affirm","human_reflect_summary","human_se_source","human_bct","human_personalization",
+    "human_total","coder_initials","coding_notes",
+  ];
+  const lines = [headers.join(",")];
+  for (const r of judgeResults) {
+    lines.push([
+      csvEscapeCell(r.scoredAt ?? ""),
+      csvEscapeCell(r.condition ? `[coded]` : ""),
+      csvEscapeCell(r.condition ?? ""),
+      csvEscapeCell(r.moduleLabel ?? ""),
+      csvEscapeCell(r.total ?? ""),
+      csvEscapeCell(r.maxTotal ?? 18),
+      csvEscapeCell(r.scores?.open_question ?? ""),
+      csvEscapeCell(r.scores?.affirm ?? ""),
+      csvEscapeCell(r.scores?.reflect_summary ?? ""),
+      csvEscapeCell(r.scores?.se_source ?? ""),
+      csvEscapeCell(r.scores?.bct ?? ""),
+      csvEscapeCell(r.scores?.personalization ?? ""),
+      csvEscapeCell(r.rationale ?? ""),
+      csvEscapeCell((r.messagePreview ?? "").slice(0, 200)),
+      "","","","","","","","","",
+    ].join(","));
+  }
+  return lines.join("\r\n");
+}
+
+/** Push de-identified conversation turns to Google Sheets (if configured). */
+async function pushConversationToSheet(entry) {
+  if (!GOOGLE_SHEETS_WEBAPP_URL || !entry?.messages?.length) return;
+  try {
+    await fetch(GOOGLE_SHEETS_WEBAPP_URL, {
+      method: "POST", mode: "no-cors",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({
+        type: "conversation",
+        participantCode: entry.profileId ?? "",
+        condition: entry.condition ?? "",
+        moduleId: entry.moduleId ?? "",
+        rows: entry.messages.map((m, i) => ({
+          turn: i + 1, role: m.role, ts: m.ts ?? "", message: m.content ?? "",
+        })),
+      }),
+    });
+  } catch (e) { console.warn("Sheet conversation push failed:", e); }
 }
 
 // ─── Theme tokens ──────────────────────────────────────────────
@@ -275,10 +632,10 @@ const CONDITIONS = [
 
 const INSTRUMENT_LABELS = {
   inst1: "Demographic Information",
-  inst2: "Job-Related PA Self-Efficacy (J-R PASE)",
-  inst3: "Transportation-Related PA Self-Efficacy (T-R PASE)",
-  inst4: "Domestic-Related PA Self-Efficacy (D-R PASE)",
-  inst5: "Leisure-Related PA Self-Efficacy (L-R PASE)",
+  inst2: "Instrument 2a — Job-Related PA Self-Efficacy (J-R PASE)",
+  inst3: "Instrument 2b — Transportation-Related PA Self-Efficacy (T-R PASE)",
+  inst4: "Instrument 2c — Domestic-Related PA Self-Efficacy (D-R PASE)",
+  inst5: "Instrument 2d — Leisure-Related PA Self-Efficacy (L-R PASE)",
   inst6: "Barrier Self-Efficacy (SERPA)",
 };
 
@@ -660,10 +1017,274 @@ const INSTRUMENT_PROMPT_SUMMARIES = {
   inst3: "T-R PASE (transport self-efficacy): 6 items, score 0-24. Higher means greater confidence for active transport (walking/cycling).",
   inst4: "D-R PASE (domestic self-efficacy): 6 items, score 0-24. Higher means greater confidence for home/family physical activity.",
   inst5: "L-R PASE (leisure self-efficacy): 12 items with moderate/vigorous subdomains. Use profile (moderate vs vigorous confidence) to set intensity.",
-  inst6: "SERPA (barrier self-efficacy): 13 items, score 0-13. Lower scores indicate key barriers (time, fatigue, weather, stress, confidence) needing small-step planning.",
+  inst6: "SERPA (barrier self-efficacy): 13 items, score 0-52. Lower scores = lower confidence to overcome barriers. Items with score ≤1 are critical targets: schedule conflicts (item 10), self-consciousness (item 11), stress (item 13), physical discomfort (item 5).",
 };
 
 const COACHING_SYSTEM_KEYS = ["chat", "checkin", "education"];
+
+// ─── Instrument assessment (quiz-widget) infrastructure ──────────────────────
+
+const QUIZ_SCALE_TAG = '[QUIZ: {"type":"scale","min":0,"max":4,"labels":["No Confidence","Low","Moderate","High","Complete Confidence"]}]';
+
+const INSTRUMENT_SHORT_LABELS = {
+  inst1: "Demographics",
+  inst2: "2a · J-R PASE",
+  inst3: "2b · T-R PASE",
+  inst4: "2c · D-R PASE",
+  inst5: "2d · L-R PASE",
+  inst6: "SERPA",
+};
+
+/** Four dedicated PASE assessment agents — one isolated AI per instrument (advisor design). */
+const PASE_INSTRUMENT_AGENTS = [
+  {
+    key: "inst2",
+    code: "2a",
+    label: "Instrument 2a — Job-Related PA Self-Efficacy (J-R PASE)",
+    shortLabel: "2a · Job",
+    aiName: "Job Activity SE Assistant",
+    aiInitials: "JA",
+    domainFocus: "job-related physical activity only (paid work, volunteer work, coursework, unpaid work outside the home)",
+  },
+  {
+    key: "inst3",
+    code: "2b",
+    label: "Instrument 2b — Transportation-Related PA Self-Efficacy (T-R PASE)",
+    shortLabel: "2b · Transport",
+    aiName: "Transport Activity SE Assistant",
+    aiInitials: "TR",
+    domainFocus: "transportation-related physical activity only (walking or cycling to get from place to place)",
+  },
+  {
+    key: "inst4",
+    code: "2c",
+    label: "Instrument 2c — Domestic-Related PA Self-Efficacy (D-R PASE)",
+    shortLabel: "2c · Domestic",
+    aiName: "Domestic Activity SE Assistant",
+    aiInitials: "DM",
+    domainFocus: "domestic-related physical activity only (housework, gardening, yard work, caring for family at home)",
+  },
+  {
+    key: "inst5",
+    code: "2d",
+    label: "Instrument 2d — Leisure-Related PA Self-Efficacy (L-R PASE)",
+    shortLabel: "2d · Leisure",
+    aiName: "Leisure Activity SE Assistant",
+    aiInitials: "LR",
+    domainFocus: "leisure-related physical activity only (recreation, sport, exercise for enjoyment)",
+  },
+];
+
+function getPaseAgent(instrumentKey) {
+  return PASE_INSTRUMENT_AGENTS.find(a => a.key === instrumentKey) ?? null;
+}
+
+const PASE_ITEM_COUNTS = { inst2: 6, inst3: 6, inst4: 6, inst5: 12 };
+
+/** Where all research data lives in this browser (localStorage). */
+const DATA_STORAGE_MAP = [
+  { key: "confidentMoves_conversations", label: "Conversation logs", desc: "Every chat turn, per module × profile × condition" },
+  { key: "confidentMoves_instrument_log", label: "Instrument submissions", desc: "Completed [INSTRUMENT_DATA] JSON records with timestamps" },
+  { key: "confidentMoves_scores_{profileId}", label: "Per-patient score cache", desc: "Latest PASE/SERPA scores injected into PA Coach (one key per profile)" },
+  { key: "confidentMoves_profiles_v1", label: "Mock profiles", desc: "Editable participant demographics and program fields" },
+  { key: "confidentMoves_program_{profileId}", label: "Program state", desc: "Program day, weight, PA minutes per profile" },
+  { key: "confidentMoves_api_metrics", label: "API feasibility metrics", desc: "Call count and rate-limit hits for Aim 3 reporting" },
+  { key: "confidentMoves_active_profile", label: "UI state", desc: "Active profile, condition, tab (not exportable research data)" },
+];
+
+function countAssessmentAnswers(convStore, moduleId, profileId) {
+  let maxAnswered = 0;
+  for (const cond of ["A", "B", "C"]) {
+    const ck = makeConversationKey(moduleId, profileId, cond);
+    const entry = convStore[ck];
+    if (!entry?.messages) continue;
+    const n = entry.messages.filter(m =>
+      m.role === "user" && !/^▶\s*Begin/i.test(String(m.content).trim())
+    ).length;
+    maxAnswered = Math.max(maxAnswered, n);
+  }
+  return maxAnswered;
+}
+
+function isInstrumentComplete(profileId, instrumentKey, scores, instrumentLog) {
+  const s = scores[instrumentKey];
+  if (s) {
+    if (instrumentKey === "inst5") return s.moderate_total != null || s.vigorous_total != null;
+    if (instrumentKey === "inst1") return Boolean(s.gender || s.employment);
+    if (instrumentKey === "inst6") return s.total_score != null;
+    return s.total_score != null;
+  }
+  return instrumentLog.some(r => r.participantId === profileId && r.instrumentKey === instrumentKey);
+}
+
+function buildFeasibilityReport() {
+  const convStore = readConvStore();
+  const instrumentLog = readInstrumentLog();
+  const apiMetrics = readApiMetrics();
+  const profiles = readProfiles();
+
+  const totalUserTurns = Object.values(convStore).reduce(
+    (acc, e) => acc + (e.messages?.filter(m => m.role === "user").length ?? 0), 0,
+  );
+  const totalAssistantTurns = Object.values(convStore).reduce(
+    (acc, e) => acc + (e.messages?.filter(m => m.role === "assistant").length ?? 0), 0,
+  );
+
+  const profileReports = profiles.map(p => {
+    const scores = readProfileScores(p.id);
+    const paseAgents = PASE_INSTRUMENT_AGENTS.map(agent => {
+      const expected = PASE_ITEM_COUNTS[agent.key] ?? 6;
+      const moduleId = `assess_${agent.code}`;
+      const answered = countAssessmentAnswers(convStore, moduleId, p.id);
+      const complete = isInstrumentComplete(p.id, agent.key, scores, instrumentLog);
+      const saved = scores[agent.key];
+      const totalScore = saved?.total_score ?? saved?.moderate_total ?? null;
+      let status = "not_started";
+      if (complete) status = "complete";
+      else if (answered > 0) status = "in_progress";
+
+      return {
+        code: agent.code,
+        key: agent.key,
+        label: agent.label,
+        shortLabel: agent.shortLabel,
+        status,
+        answered,
+        expected,
+        completionPct: complete ? 100 : Math.min(99, Math.round((answered / expected) * 100)),
+        totalScore,
+        savedAt: saved?._savedAt ?? null,
+      };
+    });
+
+    const serpaComplete = isInstrumentComplete(p.id, "inst6", scores, instrumentLog);
+    const serpaAnswered = countAssessmentAnswers(convStore, "assess_inst6", p.id);
+
+    return {
+      profileId: p.id,
+      profileName: p.name,
+      paseAgents,
+      serpa: { complete: serpaComplete, answered: serpaAnswered, expected: 13, totalScore: scores.inst6?.total_score ?? null },
+      scoresCollected: Object.keys(scores).filter(k => !k.startsWith("_")),
+    };
+  });
+
+  return {
+    generatedAt: new Date().toISOString(),
+    model: GROQ_MODEL,
+    apiMetrics,
+    conversationLogs: Object.keys(convStore).length,
+    totalUserTurns,
+    totalAssistantTurns,
+    estimatedApiCalls: apiMetrics.totalCalls || totalUserTurns,
+    instrumentSubmissions: instrumentLog.length,
+    profileReports,
+    storage: DATA_STORAGE_MAP,
+  };
+}
+
+// Trimmed administration-only texts; no coaching interpretation, just items + scale + QUIZ tags.
+const INSTRUMENT_ADMIN_TEXTS = {
+  inst1: `DEMOGRAPHICS — ask each item one at a time, in order.
+For items with fixed answer options, append the [QUIZ: ...] tag shown on the very last line of your response.
+For item 2 (income) there is no tag — the user types freely.
+1. What is your gender?
+[QUIZ: {"type":"choice","options":["Female","Male"]}]
+2. Please estimate your household's current annual income. (free text — no quiz tag)
+3. What is your ethnicity?
+[QUIZ: {"type":"choice","options":["Hispanic or Latino","Not Hispanic or Latino"]}]
+4. What is your race?
+[QUIZ: {"type":"choice","options":["American Indian or Alaska Native","Asian","Black or African American","Native Hawaiian or Other Pacific Islander","White","More than one race"]}]
+5. Highest level of education completed?
+[QUIZ: {"type":"choice","options":["Grammar School","High School or equivalent","Vocational/Technical School (2 year)","Some College","College Graduate (4 year)","Master's Degree (MS)","Doctoral Degree (PhD)","Professional Degree (MD, JD, etc.)","Other"]}]
+6. Current marital status?
+[QUIZ: {"type":"choice","options":["Divorced","Living with partner","Married","Separated","Single","Widowed"]}]
+7. Current employment status?
+[QUIZ: {"type":"choice","options":["Full Time","Part Time","Retired","Unemployed"]}]
+After all 7 items: [INSTRUMENT_DATA: {"instrument":"Demographics","gender":"","income":"","ethnicity":"","race":"","education":"","marital_status":"","employment":""}]`,
+
+  inst2: `J-R PASE — Job-Related PA Self-Efficacy.
+Context to read to participant: "Think about how confident you are to engage in JOB-RELATED physical activity (paid work, volunteer work, coursework) at MODERATE intensity in the next week."
+Scale: 0=No Confidence, 1=Low, 2=Moderate, 3=High, 4=Complete Confidence.
+STOP RULE: If participant answers 0 on item 1, record 0 for all remaining items and skip to [INSTRUMENT_DATA].
+Ask each item one at a time. After each question, append on the very last line: ${QUIZ_SCALE_TAG}
+1. How confident are you in your ability to engage in job-related PA at moderate intensity for at least 10 minutes in the next week?
+2. …for at least 30 minutes?
+3. …for at least 60 minutes?
+4. …for at least 90 minutes?
+5. …for at least 120 minutes?
+6. …for at least 150 minutes?
+After all items: [INSTRUMENT_DATA: {"instrument":"J-R PASE","item1":0,"item2":0,"item3":0,"item4":0,"item5":0,"item6":0,"total_score":0}]`,
+
+  inst3: `T-R PASE — Transportation-Related PA Self-Efficacy.
+Context to read to participant: "Think about how confident you are to engage in TRANSPORTATION-RELATED physical activity (walking or cycling to get from place to place) at MODERATE intensity in the next week."
+Scale: 0=No Confidence, 1=Low, 2=Moderate, 3=High, 4=Complete Confidence.
+STOP RULE: If participant answers 0 on item 1, record 0 for all remaining items and skip to [INSTRUMENT_DATA].
+Ask each item one at a time. After each question, append on the very last line: ${QUIZ_SCALE_TAG}
+1. How confident are you in your ability to engage in transportation-related PA at moderate intensity for at least 10 minutes in the next week?
+2. …for at least 30 minutes?
+3. …for at least 60 minutes?
+4. …for at least 90 minutes?
+5. …for at least 120 minutes?
+6. …for at least 150 minutes?
+After all items: [INSTRUMENT_DATA: {"instrument":"T-R PASE","item1":0,"item2":0,"item3":0,"item4":0,"item5":0,"item6":0,"total_score":0}]`,
+
+  inst4: `D-R PASE — Domestic-Related PA Self-Efficacy.
+Context to read to participant: "Think about how confident you are to engage in DOMESTIC-RELATED physical activity (housework, gardening, yard work, caring for family) at MODERATE intensity in the next week."
+Scale: 0=No Confidence, 1=Low, 2=Moderate, 3=High, 4=Complete Confidence.
+STOP RULE: If participant answers 0 on item 1, record 0 for all remaining items and skip to [INSTRUMENT_DATA].
+Ask each item one at a time. After each question, append on the very last line: ${QUIZ_SCALE_TAG}
+1. How confident are you in your ability to engage in domestic-related PA at moderate intensity for at least 10 minutes in the next week?
+2. …for at least 30 minutes?
+3. …for at least 60 minutes?
+4. …for at least 90 minutes?
+5. …for at least 120 minutes?
+6. …for at least 150 minutes?
+After all items: [INSTRUMENT_DATA: {"instrument":"D-R PASE","item1":0,"item2":0,"item3":0,"item4":0,"item5":0,"item6":0,"total_score":0}]`,
+
+  inst5: `L-R PASE — Leisure-Related PA Self-Efficacy.
+Scale: 0=No Confidence, 1=Low, 2=Moderate, 3=High, 4=Complete Confidence.
+STOP RULE: Stop the current part if participant answers 0 on any item; record 0 for remaining items in that part.
+Ask each item one at a time. After each question, append on the very last line: ${QUIZ_SCALE_TAG}
+
+PART A — MODERATE intensity:
+Context: "Think about how confident you are to engage in LEISURE physical activity (recreation, sport, exercise) at MODERATE intensity in the next week."
+A1. How confident are you to engage in leisure PA at MODERATE intensity for at least 10 minutes in the next week?
+A2. …for at least 30 minutes?
+A3. …for at least 60 minutes?
+A4. …for at least 90 minutes?
+A5. …for at least 120 minutes?
+A6. …for at least 150 minutes?
+
+PART B — VIGOROUS intensity:
+Context: "Now think about VIGOROUS intensity leisure activities — those that make you breathe much harder than normal (e.g., running, intense cycling)."
+B1. How confident are you to engage in leisure PA at VIGOROUS intensity for at least 10 minutes in the next week?
+B2. …for at least 15 minutes?
+B3. …for at least 30 minutes?
+B4. …for at least 45 minutes?
+B5. …for at least 60 minutes?
+B6. …for at least 75 minutes?
+After all items: [INSTRUMENT_DATA: {"instrument":"L-R PASE","moderate_items":{"item1":0,"item2":0,"item3":0,"item4":0,"item5":0,"item6":0},"vigorous_items":{"item1":0,"item2":0,"item3":0,"item4":0,"item5":0,"item6":0},"moderate_total":0,"vigorous_total":0}]`,
+
+  inst6: `SERPA — Self-Efficacy to Regulate Physical Activity (13 items, no stop rule — ask all).
+Context: "How confident are you that you can still meet the recommended weekly PA goal (150 min/wk moderate OR 75 min/wk vigorous) when the following happens?"
+Scale: 0=No Confidence, 1=Low, 2=Moderate, 3=High, 4=Complete Confidence.
+Ask each item one at a time. After each question, append on the very last line: ${QUIZ_SCALE_TAG}
+1. The weather is very bad?
+2. You are bored with the physical activities available?
+3. You are on vacation?
+4. You are uninterested in the physical activities available?
+5. You feel physical discomfort while being physically active?
+6. You have to be physically active by yourself?
+7. You do not enjoy the physical activities available?
+8. It is difficult to get to a location suitable for PA?
+9. You do not like the physical activities available?
+10. Your schedule conflicts with being physically active?
+11. You feel self-conscious about your appearance while being physically active?
+12. You do not receive any encouragement for being physically active?
+13. You are under personal stress?
+After all 13 items: [INSTRUMENT_DATA: {"instrument":"SERPA","item1":0,"item2":0,"item3":0,"item4":0,"item5":0,"item6":0,"item7":0,"item8":0,"item9":0,"item10":0,"item11":0,"item12":0,"item13":0,"total_score":0}]`,
+};
 
 const DEFAULT_PROFILES = [
   {
@@ -784,6 +1405,162 @@ function estBmiFromWeight(weightLbs, patient) {
   return ((patient.bmi.baseline * w) / patient.weight.baseline).toFixed(1);
 }
 
+// ─── Lightweight RAG knowledge base ───────────────────────────
+// Each chunk is a self-contained clinical or theory fact the AI can
+// cite in a response. At build time we keyword-match the patient's
+// last message + their barrier/domain to select the top 2–3 chunks.
+// This is "retrieval" not "training" — chunks are injected into the
+// system prompt at inference time; the model weights never change.
+
+const KNOWLEDGE_CHUNKS = [
+  // ── PA Guidelines ──────────────────────────────────────────
+  {
+    id: "pa_guidelines_moderate",
+    tags: ["pa", "guidelines", "moderate", "minutes", "150", "weekly"],
+    text: "ACSM/AHA (2023): Adults need ≥150 min/week moderate-intensity PA OR ≥75 min/week vigorous PA. Bouts of ≥10 min count. For adults with obesity, start at 50–75% of target and progress gradually.",
+  },
+  {
+    id: "pa_guidelines_obesity",
+    tags: ["pa", "obesity", "weight", "bmi", "exercise"],
+    text: "For adults with obesity, PA recommendations prioritize low-impact activity (walking, swimming, cycling) to reduce joint stress. Duration > intensity in early stages. 200–300 min/week needed for weight maintenance after loss.",
+  },
+  {
+    id: "pa_guidelines_fragmented",
+    tags: ["pa", "busy", "time", "short", "break", "10", "minutes", "schedule"],
+    text: "Fragmented PA (3×10 min/day) produces comparable cardiovascular benefits to continuous bouts. Walking after meals is particularly effective for glycemic control in T2D and prediabetes.",
+  },
+  // ── Self-Efficacy Coaching Rules ───────────────────────────
+  {
+    id: "se_low_job",
+    tags: ["job", "work", "volunteer", "course", "low", "confidence", "jr pase", "2a"],
+    text: "Low J-R PASE (0–8): Do NOT suggest adding new work-based activity. Instead identify movement that already exists in the work context (walking between tasks, standing breaks). Reframe existing movement as PA achievement.",
+  },
+  {
+    id: "se_low_transport",
+    tags: ["transport", "walk", "cycle", "commute", "bus", "car", "low", "tr pase", "2b"],
+    text: "Low T-R PASE (0–8): Start with one regular destination where a short walk is possible. Parking further away or getting off transit one stop early both count. Micro-goal: add 5–10 min to one existing trip.",
+  },
+  {
+    id: "se_low_domestic",
+    tags: ["home", "house", "housework", "garden", "domestic", "family", "low", "dr pase", "2c"],
+    text: "Low D-R PASE (0–8): Validate that housework, gardening, and family care ARE physical activity. Help patient recognize movement they may not count as exercise. Reframe existing domestic activity as PA achievement.",
+  },
+  {
+    id: "se_low_leisure",
+    tags: ["leisure", "recreation", "sport", "gym", "exercise", "hobby", "low", "lr pase", "2d"],
+    text: "Low L-R PASE moderate (0–8): Start with most accessible leisure activity — walking. 10-min neighborhood walks, mall walking, park visits. Do NOT suggest vigorous activity until moderate confidence improves.",
+  },
+  {
+    id: "se_high_any",
+    tags: ["high", "confidence", "strong", "doing well", "good", "motivated"],
+    text: "High SE domain: Treat this as a strength to build from. Connect past success in this domain to other lower-SE domains. Extend goals gradually — if current plan is working, ask what would make it 10% bigger.",
+  },
+  // ── SERPA Barrier Coaching Rules ───────────────────────────
+  {
+    id: "serpa_schedule",
+    tags: ["schedule", "time", "busy", "no time", "too tired", "work", "evening"],
+    text: "Schedule barrier (SERPA item 10): Explore actual vs perceived time. Identify 2–3 schedule anchors (morning routine, lunch, post-dinner). Implementation intention: 'When I [anchor], I will do [10-min walk].' 10 minutes is enough — start there.",
+  },
+  {
+    id: "serpa_self_conscious",
+    tags: ["self-conscious", "embarrassed", "appearance", "gym", "people watching", "weight", "fat", "ashamed"],
+    text: "Self-consciousness barrier (SERPA item 11): CRITICAL for obesity population. Validate without judgment — never reference weight or appearance. Suggest home-based or low-visibility options first: home walking, private outdoor time, online exercise videos.",
+  },
+  {
+    id: "serpa_discomfort",
+    tags: ["pain", "hurts", "discomfort", "joint", "knee", "back", "tired", "fatigue", "sore"],
+    text: "Physical discomfort barrier (SERPA item 5): Validate discomfort first — never push through pain. Suggest chair-based exercise, water walking, or gentle stretching. Lower intensity AND shorter duration. Escalate if pain is new or severe.",
+  },
+  {
+    id: "serpa_weather",
+    tags: ["weather", "rain", "cold", "hot", "outside", "outdoor", "winter"],
+    text: "Weather barrier (SERPA item 1): Remove outdoor dependency. Home-based options: walking in place, stairs, exercise videos, chair exercises. Indoor public spaces: mall walking, community centers. Reframe: weather-proof activity exists.",
+  },
+  {
+    id: "serpa_alone",
+    tags: ["alone", "lonely", "no one", "partner", "friend", "support", "social", "by myself"],
+    text: "Social support barrier (SERPA item 6): Lack of support undermines SE. Explore social options — walking groups, online communities, phone PA with a friend. If none available, normalize solo activity as a personal strength.",
+  },
+  {
+    id: "serpa_stress",
+    tags: ["stress", "stressed", "overwhelmed", "anxious", "depressed", "mental", "rough", "hard week"],
+    text: "Stress barrier (SERPA item 13): Validate stress fully before any PA suggestion. In high-stress periods, survival-mode goals only: smallest possible commitment (5 min, one walk). PA itself reduces stress — frame as relief, not obligation.",
+  },
+  {
+    id: "serpa_no_encouragement",
+    tags: ["no encouragement", "no one cares", "alone", "nobody", "support", "motivation"],
+    text: "No encouragement barrier (SERPA item 12): The coaching AI's primary role here is to BE the social persuasion SE source. Provide specific, genuine affirmation every session. Reference patient's own stated wins, not generic praise.",
+  },
+  // ── GLP-1 + Exercise ───────────────────────────────────────
+  {
+    id: "glp1_nausea_exercise",
+    tags: ["nausea", "sick", "side effect", "injection", "medication", "semaglutide", "glp1", "tired"],
+    text: "GLP-1 receptor agonists (semaglutide, tirzepatide): Early weeks commonly cause nausea, fatigue, and reduced appetite. These may limit exercise tolerance. Reduce intensity and duration during first 4–8 weeks. Nausea improves with dose stabilization. Always escalate if severe.",
+  },
+  {
+    id: "glp1_muscle",
+    tags: ["muscle", "strength", "resistance", "lean", "mass", "glp1", "semaglutide"],
+    text: "GLP-1 therapy causes weight loss that includes muscle mass loss. Resistance exercise (2×/week) is recommended alongside aerobic PA to preserve lean mass. Even light resistance training (bands, bodyweight) is beneficial.",
+  },
+  // ── BCT Decision Rules ─────────────────────────────────────
+  {
+    id: "bct_action_plan",
+    tags: ["plan", "when", "where", "how", "goal", "specific", "schedule"],
+    text: "Action planning (BCT): Effective PA plans specify WHEN (day + time), WHERE (location), HOW LONG. Implementation intention format: 'If [situation], then I will [PA behavior].' Patient must agree — never prescribe.",
+  },
+  {
+    id: "bct_confidence_check",
+    tags: ["confident", "confidence", "sure", "can do", "try", "maybe", "0 to 10"],
+    text: "Confidence check (BCT): Ask 0–10 confidence scale for the specific plan. If <7, shrink the goal until confidence rises. The right goal is one the patient will actually do, not the optimal clinical goal.",
+  },
+  {
+    id: "bct_problem_solving",
+    tags: ["barrier", "problem", "obstacle", "hard", "difficult", "challenge", "stuck"],
+    text: "Problem solving (BCT): Identify one barrier → brainstorm two options → patient picks. Avoid solving for them. Use 'What have you tried before?' to elicit their own solutions first.",
+  },
+];
+
+/** Lightweight RAG retriever — keyword-based (no embeddings needed for feasibility).
+ *  Takes the patient's last message + their known barriers/domains and returns
+ *  the top matching chunks to inject into the system prompt.
+ *  Phase 2: replace with semantic vector search (pgvector / Pinecone). */
+function retrieveChunks(userMessage, patientBarrier = "", patientScores = {}, topN = 3) {
+  const query = `${userMessage} ${patientBarrier}`.toLowerCase();
+
+  // Also build domain signals from scores (trigger low-SE rules automatically)
+  const domainSignals = [];
+  if (patientScores.inst2?.total_score != null && patientScores.inst2.total_score <= 8) domainSignals.push("jr pase low job work");
+  if (patientScores.inst3?.total_score != null && patientScores.inst3.total_score <= 8) domainSignals.push("tr pase low transport commute");
+  if (patientScores.inst4?.total_score != null && patientScores.inst4.total_score <= 8) domainSignals.push("dr pase low home domestic");
+  if (patientScores.inst5?.moderate_total != null && patientScores.inst5.moderate_total <= 8) domainSignals.push("lr pase low leisure exercise");
+  if (patientScores.inst6) {
+    const s = patientScores.inst6;
+    if ((s.item10 ?? 4) <= 1) domainSignals.push("schedule time busy");
+    if ((s.item11 ?? 4) <= 1) domainSignals.push("self-conscious appearance embarrassed");
+    if ((s.item5 ?? 4) <= 1) domainSignals.push("pain discomfort joint");
+    if ((s.item13 ?? 4) <= 1) domainSignals.push("stress stressed overwhelmed");
+    if ((s.item6 ?? 4) <= 1) domainSignals.push("alone no support social");
+    if ((s.item1 ?? 4) <= 1) domainSignals.push("weather outdoor rain cold");
+  }
+
+  const fullQuery = `${query} ${domainSignals.join(" ")}`;
+
+  const scored = KNOWLEDGE_CHUNKS.map(chunk => {
+    const hits = chunk.tags.filter(tag => fullQuery.includes(tag)).length;
+    return { chunk, hits };
+  }).filter(x => x.hits > 0)
+    .sort((a, b) => b.hits - a.hits)
+    .slice(0, topN);
+
+  return scored.map(x => x.chunk);
+}
+
+/** Format retrieved chunks into a compact block for injection into the system prompt. */
+function buildRagBlock(chunks) {
+  if (!chunks.length) return "";
+  return `\nRETRIEVED KNOWLEDGE (use these facts to ground your response — do not copy verbatim; synthesize naturally):\n${chunks.map((c, i) => `[${i + 1}] ${c.text}`).join("\n")}`;
+}
+
 function buildInstrumentInjectionBlock(conditionId) {
   const cond = CONDITIONS.find(c => c.id === conditionId);
   if (!cond?.instruments?.length) return "";
@@ -857,6 +1634,11 @@ function buildSystems(rt, patient, conditionId = "A") {
   const totalProgramDays = getTotalProgramDays(patient);
   const withTheory = CONDITIONS.find(c => c.id === conditionId)?.includeTheory ?? conditionId !== "A";
 
+  // Read any instrument scores collected for this profile (from assessment sessions).
+  // For Conditions B/C, inject these into coaching prompts so the AI can personalize.
+  const profileScores = withTheory ? readProfileScores(patient.id) : {};
+  const scoreContextBlock = buildScoreContextBlock(profileScores);
+
   const patientContext = `Patient: ${patient.name}, Trial: ${patient.trial}, Drug: ${patient.drug}.
 Program timeline: Day ${programDay} of ${totalProgramDays} (week ${programWeek} of ${patient.totalWeeks}).
 Self-report: weight ${currentWeight} lbs; estimated BMI ~${estBmi} (baseline BMI ${patient.bmi.baseline}); this week's PA total ${weeklyPaMins} / ${weeklyPaGoal} min; active days with movement this week: ${activeDaysThisWeek} / ${activeDaysGoal}.
@@ -877,7 +1659,7 @@ Top PA barrier: ${patient.pa.topBarrier}. Favorite activity: ${patient.pa.favori
 
   const chatTrained = `You are ObesityCare AI, a clinical support assistant embedded in an obesity management trial platform. Your coaching is grounded in two theory-aligned pillars: (1) social cognitive theory — specifically Bandura's self-efficacy — and (2) motivational interviewing, expressed through the PACE relational components (Partnership, Acceptance, Compassion, Empowerment). You also draw on common elements of evidence-based behavior change techniques (BCTs) used in lifestyle trials (e.g., goal setting, action planning, problem solving, self-monitoring of behavior).
 
-${patientContext}
+${patientContext}${scoreContextBlock}
 
 THEORY 1 — SELF-EFFICACY (Bandura)
 Self-efficacy is the person's confidence that they can perform a behavior in a given context. In practice, support mastery, credible encouragement, context, and emotional safety — not generic praise.
@@ -895,6 +1677,18 @@ EVIDENCE-ALIGNED STRATEGIES (use when relevant; do not stack all in one reply)
 - Confidence / importance: Brief 0–10 check ("How confident are you that you can do that plan?"); if confidence is low, shrink the step until confidence rises.
 - Problem solving: Identify barrier → brainstorm one or two options → patient picks; avoid solving for them.
 
+INTERNAL REASONING (chain-of-thought — NEVER print this section; it is your private checklist):
+Before writing every coaching reply, silently answer these four questions, then write only the final response:
+  Q1. SE source: Which of the four Bandura sources (mastery / vicarious / verbal-social persuasion / physiological-affective) is most relevant to what the patient just said? If none clearly applies, note that.
+  Q2. PACE element: Which of the four MI components (Partnership / Acceptance / Compassion / Empowerment) should most shape the tone of this reply?
+  Q3. Score signal: Is there collected assessment data (PASE domain or SERPA barrier) that should change what I say or suggest? If yes, which domain and how?
+  Q4. One thing: What is the single most useful thing to say or ask right now? (Only one — do not stack multiple BCTs or ask multiple questions.)
+Write only the final coaching response — never show Q1–Q4 to the patient.
+
+PROACTIVE ASSESSMENT SUGGESTION: If the patient mentions a domain of uncertainty or a barrier that maps to an assessment instrument, you may — once per session, naturally — invite them to complete the relevant tool (e.g., "You mentioned worrying about being active alone — would you like to take a quick 2-minute survey so I can understand your confidence better? You can find it in the Assessments bar at the top"). Keep it optional, brief, and framed as useful to them.
+
+QUIZ TAGS (assessment administration only): When directly asking a research instrument question that has fixed answer options (PASE confidence scale OR demographic categories), append the appropriate [QUIZ: {...}] tag as the very last line of your response with no text after it. Use [QUIZ: {"type":"scale","min":0,"max":4,"labels":["No Confidence","Low","Moderate","High","Complete Confidence"]}] for any 0–4 confidence item; use [QUIZ: {"type":"choice","options":["A","B","..."]}] for categorical choices. NEVER include [QUIZ:] in regular coaching or conversational replies — only when administering a specific scored item.
+
 ${operatingRules}`;
 
   const chatBaseline = `You are ObesityCare AI, a supportive assistant for participants in an obesity management trial. Answer questions helpfully about physical activity, lifestyle, and the program. Be warm and practical. Do not use formal behavior-change theory frameworks, named psychological models (e.g., self-efficacy, motivational interviewing, PACE), or structured coaching protocols unless the participant explicitly asks for them.
@@ -903,7 +1697,7 @@ ${patientContext}
 
 ${operatingRules}`;
 
-  const checkinTrained = `You are ObesityCare Confident Moves AI conducting a structured daily check-in for a clinical trial participant. Use brief, collaborative language grounded in self-efficacy support and motivational interviewing (PACE: Partnership, Acceptance, Compassion, Empowerment). Acknowledge effort; ask one thing at a time; no judgment; reflect before the next question.
+  const checkinTrained = `You are ObesityCare Confident Moves AI conducting a structured daily check-in for a clinical trial participant. Use brief, collaborative language grounded in self-efficacy support and motivational interviewing (PACE: Partnership, Acceptance, Compassion, Empowerment). Acknowledge effort; ask one thing at a time; no judgment; reflect before the next question. QUIZ TAGS: If administering a research instrument question with fixed options, append [QUIZ: {...}] as the very last line (see PA Coach format instructions).
 Patient: ${patient.name}, program day ${programDay} (week ${programWeek}), Drug: ${patient.drug}.
 Self-reported weight ${currentWeight} lbs; weekly PA minutes so far ${weeklyPaMins} / ${weeklyPaGoal}.
 Conduct a brief, empathetic check-in. Ask ONE question at a time about:
@@ -1012,8 +1806,92 @@ function TypingDots() {
   );
 }
 
+/** Renders inline clickable answer buttons for research instrument questions.
+ *  quiz.type === "scale"  → numbered confidence buttons (0–4)
+ *  quiz.type === "choice" → text option buttons */
+function QuizWidget({ quiz, onSelect }) {
+  const [selected, setSelected] = useState(null);
+
+  const pick = (displayValue) => {
+    if (selected !== null) return;
+    setSelected(displayValue);
+    onSelect(displayValue);
+  };
+
+  if (quiz.type === "scale") {
+    const min = quiz.min ?? 0;
+    const max = quiz.max ?? 4;
+    const labels = quiz.labels ?? [];
+    return (
+      <div style={{ marginTop: 12, display: "flex", gap: 7, flexWrap: "wrap" }}>
+        {Array.from({ length: max - min + 1 }, (_, i) => i + min).map(val => {
+          const label = labels[val - min] ?? String(val);
+          const isSel = selected === `${val} — ${label}`;
+          const isDimmed = selected !== null && !isSel;
+          return (
+            <button
+              key={val}
+              onClick={() => pick(`${val} — ${label}`)}
+              disabled={selected !== null}
+              style={{
+                display: "flex", flexDirection: "column", alignItems: "center",
+                padding: "8px 11px", borderRadius: 10,
+                border: `2px solid ${isSel ? T.teal : T.gray300}`,
+                background: isSel ? T.tealLight : "#fff",
+                color: isSel ? T.teal : T.gray700,
+                cursor: selected !== null ? "default" : "pointer",
+                fontFamily: "'DM Sans', sans-serif",
+                transition: "all .15s",
+                minWidth: 54,
+                opacity: isDimmed ? 0.35 : 1,
+                boxShadow: isSel ? `0 0 0 1px ${T.teal}` : "none",
+              }}
+            >
+              <span style={{ fontSize: 19, fontWeight: 700, lineHeight: 1 }}>{val}</span>
+              <span style={{ fontSize: 9, marginTop: 4, textAlign: "center", lineHeight: 1.25, maxWidth: 58 }}>{label}</span>
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
+
+  if (quiz.type === "choice") {
+    return (
+      <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 5 }}>
+        {(quiz.options ?? []).map(opt => {
+          const isSel = selected === opt;
+          const isDimmed = selected !== null && !isSel;
+          return (
+            <button
+              key={opt}
+              onClick={() => pick(opt)}
+              disabled={selected !== null}
+              style={{
+                textAlign: "left", padding: "8px 14px", borderRadius: 8,
+                border: `1.5px solid ${isSel ? T.teal : T.gray300}`,
+                background: isSel ? T.tealLight : "#fff",
+                color: isSel ? T.teal : T.gray700,
+                cursor: selected !== null ? "default" : "pointer",
+                fontFamily: "'DM Sans', sans-serif",
+                fontSize: 13, fontWeight: isSel ? 600 : 400,
+                transition: "all .15s",
+                opacity: isDimmed ? 0.35 : 1,
+              }}
+            >
+              {isSel ? "✓ " : ""}{opt}
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
+
+  return null;
+}
+
 // ─── Chat Engine ──────────────────────────────────────────────
-function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro, persistInstrument, conversationKey, conversationLabel, conversationMeta, patient }) {
+function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro, persistInstrument, conversationKey, conversationLabel, conversationMeta, patient, assistantInitials = "AI", apiMinIntervalMs, ragEnabled = false, ragScores = null }) {
   const initialMessages = useMemo(() => {
     if (conversationKey) {
       const saved = readConvStore()[conversationKey]?.messages;
@@ -1066,10 +1944,25 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
     setLoading(true);
 
     const apiMessages = newMessages.slice(-8).map(m => ({ role: m.role, content: m.content }));
+
+    // RAG: retrieve relevant knowledge chunks based on the user's message + patient context.
+    // Inject into system prompt for this call only — does not change stored prompts.
+    let activeSystemPrompt = systems[systemKey];
+    if (ragEnabled && systemKey === "chat" && !persistInstrument) {
+      const chunks = retrieveChunks(
+        userMsg,
+        patient?.pa?.topBarrier ?? "",
+        ragScores ?? {},
+        3,
+      );
+      const ragBlock = buildRagBlock(chunks);
+      if (ragBlock) activeSystemPrompt = activeSystemPrompt + ragBlock;
+    }
+
     let finalText = "";
     let finalMsgs = withPlaceholder;
     try {
-      await callGroq(apiMessages, systems[systemKey], (chunk) => {
+      await callGroq(apiMessages, activeSystemPrompt, (chunk) => {
         finalText = chunk;
         setMessages(prev => {
           const updated = [...prev];
@@ -1077,7 +1970,30 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
           finalMsgs = updated;
           return updated;
         });
+      }, {
+        minIntervalMs: apiMinIntervalMs ?? (persistInstrument ? ASSESSMENT_GROQ_INTERVAL_MS : MIN_GROQ_INTERVAL_MS),
+        maxTokens: persistInstrument ? 280 : 350,
       });
+
+      // After streaming completes, parse [QUIZ:] from the final response (or infer in assessment mode).
+      const { quiz: parsedQuiz, cleanText: cleanedText } = parseQuizFromMessage(finalText);
+      let quiz = parsedQuiz;
+      let displayText = parsedQuiz ? cleanedText : finalText;
+      if (!quiz && persistInstrument?.key) {
+        quiz = inferAssessmentQuiz(finalText, persistInstrument.key);
+      }
+      if (quiz) {
+        finalText = displayText;
+        setMessages(prev => {
+          const updated = [...prev];
+          const lastIdx = updated.length - 1;
+          if (updated[lastIdx]?.role === "assistant") {
+            updated[lastIdx] = { ...updated[lastIdx], content: displayText, quiz };
+          }
+          finalMsgs = updated;
+          return updated;
+        });
+      }
 
       if (persistInstrument && finalText && !finalText.startsWith("⚠️")) {
         const parsed = extractInstrumentJson(finalText);
@@ -1110,7 +2026,7 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
       let friendlyMsg = `⚠️ Error: ${errMsg}\n\nCheck the browser console (F12) for details.`;
       if (errMsg.includes("400")) friendlyMsg = "⚠️ API Error 400: Bad request — check your Groq API key and request payload.";
       if (errMsg.includes("403")) friendlyMsg = "⚠️ API Error 403: Permission denied — your Groq key may be invalid or expired.";
-      if (errMsg.includes("429")) friendlyMsg = "⚠️ API Error 429: Rate limit hit. Wait a moment and try again.";
+      if (errMsg.includes("429")) friendlyMsg = "⚠️ Groq rate limit (429). The app auto-retried several times — wait 30–60 seconds, then send your message again. Tip: pause ~4 seconds between quiz answers during assessments. Free-tier limits are tight; using llama-3.1-8b-instant helps.";
       if (errMsg.includes("Failed to fetch") || errMsg.includes("NetworkError")) friendlyMsg = "⚠️ Network error: Could not reach Groq API. Check your internet connection.";
       setMessages(prev => {
         const updated = [...prev];
@@ -1121,7 +2037,16 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
     }
     setLoading(false);
     persistConv(finalMsgs);
-  }, [messages, loading, systemKey, systems, persistInstrument, persistConv, patient, conversationMeta]);
+    // Push de-identified conversation to Google Sheets on every saved turn (fire-and-forget).
+    if (conversationKey && conversationMeta) {
+      pushConversationToSheet({
+        profileId: conversationMeta.profileId ?? "",
+        condition: conversationMeta.condition ?? "",
+        moduleId: conversationMeta.moduleId ?? "",
+        messages: finalMsgs,
+      });
+    }
+  }, [messages, loading, systemKey, systems, persistInstrument, persistConv, patient, conversationMeta, conversationKey]);
 
   const handleKey = (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); }
@@ -1130,10 +2055,17 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", overscrollBehavior: "contain", padding: "16px 20px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
-        {messages.map((m, i) => (
+        {messages.map((m, i) => {
+          const isLast = i === messages.length - 1;
+          const effectiveQuiz = m.quiz ?? (
+            persistInstrument?.key && m.role === "assistant" && isLast && !loading && !m.quizAnswered
+              ? inferAssessmentQuiz(m.content, persistInstrument.key)
+              : null
+          );
+          return (
           <div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start", flexDirection: m.role === "user" ? "row-reverse" : "row", maxWidth: "90%", alignSelf: m.role === "user" ? "flex-end" : "flex-start" }}>
             <Avatar
-              initials={m.role === "user" ? patientInitials(patient?.name ?? "User") : "AI"}
+              initials={m.role === "user" ? patientInitials(patient?.name ?? "User") : assistantInitials}
               color={m.role === "user" ? T.chatUserAvatarFg : T.chatAiAvatarFg}
               bg={m.role === "user" ? T.chatUserAvatarBg : T.chatAiAvatarBg}
               size={30}
@@ -1148,12 +2080,27 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
               boxShadow: m.role === "user" ? "0 1px 2px rgba(15, 23, 42, 0.06)" : "0 1px 2px rgba(15, 23, 42, 0.04)",
             }}>
               {m.content === "" ? <TypingDots /> : m.content}
+              {effectiveQuiz && !m.quizAnswered && isLast && !loading && (
+                <QuizWidget
+                  key={`quiz-${i}`}
+                  quiz={effectiveQuiz}
+                  onSelect={(answer) => {
+                    setMessages(prev => {
+                      const updated = [...prev];
+                      updated[i] = { ...updated[i], quizAnswered: true, quiz: effectiveQuiz };
+                      return updated;
+                    });
+                    send(answer);
+                  }}
+                />
+              )}
             </div>
           </div>
-        ))}
+          );
+        })}
         {loading && messages[messages.length - 1]?.role !== "assistant" && (
           <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
-            <Avatar initials="AI" color={T.chatAiAvatarFg} bg={T.chatAiAvatarBg} size={30} />
+            <Avatar initials={assistantInitials} color={T.chatAiAvatarFg} bg={T.chatAiAvatarBg} size={30} />
             <div style={{
               padding: "10px 14px",
               background: T.chatAiBubble,
@@ -1257,19 +2204,177 @@ function buildConvProps(moduleId, moduleLabel, patient, conditionId, conditionLa
   };
 }
 
+/** Build a system prompt for a standalone instrument assessment session.
+ *  PASE instruments (2a–2d) each get a dedicated agent persona and isolated scope. */
+function buildAssessmentSystem(instrumentKey, patient) {
+  const label = INSTRUMENT_LABELS[instrumentKey] ?? instrumentKey;
+  const adminText = INSTRUMENT_ADMIN_TEXTS[instrumentKey] ?? "";
+  const paseAgent = getPaseAgent(instrumentKey);
+
+  const identityBlock = paseAgent
+    ? `You are the ${paseAgent.aiName} — a dedicated, isolated assessment agent for ${paseAgent.label}.
+You administer ONLY ${paseAgent.domainFocus}. You do NOT ask about other PA domains (job, transport, domestic, leisure) or other instruments.
+If the participant asks about a different domain, warmly redirect: "I'm here specifically for ${paseAgent.label.split("—")[1]?.trim() ?? "this assessment"} — your PA Coach can help with broader activity planning."`
+    : `You are ObesityCare AI administering the ${label} research instrument to a clinical trial participant.`;
+
+  return `${identityBlock}
+Work through each question one at a time in a warm, non-judgmental way (PACE: Partnership, Acceptance, Compassion, Empowerment).
+
+Patient: ${patient.name}, Trial: ${patient.trial}.
+
+CRITICAL — QUIZ TAGS (REQUIRED ON EVERY SCORED ITEM): Every response that asks a scored item MUST end with the exact [QUIZ: ...] tag on the very last line — including item 2, 3, 4, etc. Copy the tag verbatim from the instrument text below. Zero characters after the closing ]. Example last line for any PASE/SERPA confidence item:
+${QUIZ_SCALE_TAG}
+If a question has no [QUIZ:] tag in the instrument text (e.g. free-text income), do not include one.
+
+${adminText}
+
+RULES:
+- Ask exactly one question per response; wait for the participant's answer before continuing.
+- Structure each turn as: (optional) one brief acknowledgment sentence, then the next numbered question, then the [QUIZ:] tag on its own last line.
+- Brief acknowledgments must NOT replace the [QUIZ:] tag — the tag is still required every time.
+- Follow all STOP RULE instructions in the instrument text.
+- Never diagnose or recommend treatment changes. Flag distress with [ESCALATE].
+- When the full instrument is complete and you have output [INSTRUMENT_DATA: {...}], briefly summarize the scores in plain language and note what they suggest for their activity plan in THIS domain only.`;
+}
+
 // ─── Modules ──────────────────────────────────────────────────
 function ChatModule({ systems, patient, programDay, programWeek, conditionId, conditionLabel }) {
+  const [assessKey, setAssessKey] = useState(null);
+
+  // RAG is active in Conditions B and C (theory-informed) for the main PA Coach only.
+  const withTheory = CONDITIONS.find(c => c.id === conditionId)?.includeTheory ?? false;
+  const ragScores = withTheory ? readProfileScores(patient.id) : {};
+
+  const paseAgent = assessKey ? getPaseAgent(assessKey) : null;
+  const isPaseAssessment = Boolean(paseAgent);
+  const assessLabel = isPaseAssessment
+    ? paseAgent.label
+    : (INSTRUMENT_LABELS[assessKey] ?? assessKey);
+  const assessInitials = isPaseAssessment ? paseAgent.aiInitials : "AI";
+  const assessModuleId = isPaseAssessment ? `assess_${paseAgent.code}` : `assess_${assessKey}`;
+
+  if (assessKey) {
+    const assessSys = { chat: buildAssessmentSystem(assessKey, patient) };
+    const assessConv = buildConvProps(
+      assessModuleId,
+      isPaseAssessment ? `${paseAgent.code} ${paseAgent.aiName}` : `${INSTRUMENT_SHORT_LABELS[assessKey] ?? assessKey} Assessment`,
+      patient,
+      conditionId,
+      conditionLabel,
+    );
+    const assessIntro = isPaseAssessment
+      ? `Hello ${patient.name}! I'm the ${paseAgent.aiName} — I administer ${paseAgent.label} only.\n\nI'll ask about your confidence for ${paseAgent.domainFocus} over the next week, one question at a time. Tap the answer buttons when they appear, or type your response.\n\nWhen you're ready, click below to begin.`
+      : `Let's go through the ${assessLabel} together, ${patient.name}. I'll ask each question one at a time — you can tap an answer button when they appear, or type your response.\n\nWhen you're ready, click the button below to begin.`;
+
+    return (
+      <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
+        <div style={{
+          padding: "8px 16px", borderBottom: `1px solid ${T.tealBorder ?? T.teal}`,
+          display: "flex", alignItems: "center", gap: 10,
+          background: T.tealLight, flexShrink: 0, flexWrap: "wrap",
+        }}>
+          <button
+            onClick={() => setAssessKey(null)}
+            style={{
+              fontSize: 12, fontWeight: 600, color: T.teal, background: "none",
+              border: "none", cursor: "pointer", padding: "2px 0",
+              fontFamily: "'DM Sans', sans-serif",
+            }}
+          >← PA Coach</button>
+          <span style={{ color: T.gray400, fontSize: 12 }}>|</span>
+          <span style={{ fontSize: 12, fontWeight: 600, color: T.teal }}>
+            {isPaseAssessment ? `${paseAgent.code} · ${paseAgent.aiName}` : `📋 ${assessLabel}`}
+          </span>
+          {isPaseAssessment && (
+            <span style={{ fontSize: 10, color: T.gray500, marginLeft: "auto" }}>
+              Dedicated agent · separate conversation log
+            </span>
+          )}
+        </div>
+        <ChatEngine
+          key={assessConv.conversationKey}
+          systems={assessSys}
+          systemKey="chat"
+          placeholder="Select an answer button or type a free-text response..."
+          intro={assessIntro}
+          quickReplies={["▶ Begin the assessment"]}
+          persistInstrument={{ key: assessKey, label: assessLabel }}
+          assistantInitials={assessInitials}
+          {...assessConv}
+          patient={patient}
+        />
+      </div>
+    );
+  }
+
   const conv = buildConvProps("chat", "PA Coach", patient, conditionId, conditionLabel);
+  const OTHER_ASSESS_KEYS = ["inst1", "inst6"];
+
   return (
-    <ChatEngine
-      key={conv.conversationKey}
-      systems={systems}
-      systemKey="chat"
-      placeholder="Ask about activity goals, barriers, motivation, or your treatment..."
-      intro={`Hello ${patient.name}! I'm your Confident Moves PA coach. I'm here to help you build a sustainable, personalized physical activity routine that works with your body and your life.\n\nToday is program day ${programDay} (week ${programWeek}) — every step counts. We can work on setting goals, finding activities you enjoy, or problem-solving barriers like ${patient.pa.topBarrier}.\n\nWhat's on your mind today?`}
-      quickReplies={["Help me set a PA goal", "I'm struggling to stay motivated", "What activity suits my fitness level?", "How does exercise help with my weight loss?", "Had some side effects this week"]}
-      {...conv}
-    />
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
+      <div style={{
+        padding: "6px 16px", borderBottom: `1px solid ${T.gray200}`,
+        display: "flex", flexDirection: "column", gap: 6,
+        background: T.gray100 ?? "#f8f9fa", flexShrink: 0,
+      }}>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+          <span style={{ fontSize: 10, fontWeight: 700, color: T.gray500, letterSpacing: ".06em", textTransform: "uppercase", marginRight: 2 }}>
+            PASE agents (4 separate AIs)
+          </span>
+          {PASE_INSTRUMENT_AGENTS.map(agent => (
+            <button
+              key={agent.key}
+              onClick={() => setAssessKey(agent.key)}
+              title={agent.label}
+              style={{
+                fontSize: 11, padding: "4px 11px", borderRadius: 12,
+                border: `1px solid ${T.teal}`, background: "#fff",
+                color: T.teal, cursor: "pointer",
+                fontFamily: "'DM Sans', sans-serif", transition: "all .15s",
+                fontWeight: 600,
+              }}
+              onMouseOver={e => { e.currentTarget.style.background = T.tealLight; }}
+              onMouseOut={e => { e.currentTarget.style.background = "#fff"; }}
+            >
+              {agent.shortLabel}
+            </button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+          <span style={{ fontSize: 10, fontWeight: 600, color: T.gray400, marginRight: 2 }}>
+            Other
+          </span>
+          {OTHER_ASSESS_KEYS.map(k => (
+            <button
+              key={k}
+              onClick={() => setAssessKey(k)}
+              style={{
+                fontSize: 11, padding: "3px 10px", borderRadius: 12,
+                border: `1px solid ${T.gray300}`, background: "#fff",
+                color: T.gray600, cursor: "pointer",
+                fontFamily: "'DM Sans', sans-serif", transition: "all .15s",
+              }}
+              onMouseOver={e => { e.currentTarget.style.borderColor = T.teal; e.currentTarget.style.color = T.teal; }}
+              onMouseOut={e => { e.currentTarget.style.borderColor = T.gray300; e.currentTarget.style.color = T.gray600; }}
+            >
+              {INSTRUMENT_SHORT_LABELS[k] ?? k}
+            </button>
+          ))}
+        </div>
+      </div>
+      <ChatEngine
+        key={conv.conversationKey}
+        systems={systems}
+        systemKey="chat"
+        placeholder="Ask about activity goals, barriers, motivation, or your treatment..."
+        intro={`Hello ${patient.name}! I'm your Confident Moves PA coach. I'm here to help you build a sustainable, personalized physical activity routine that works with your body and your life.\n\nToday is program day ${programDay} (week ${programWeek}) — every step counts. We can work on setting goals, finding activities you enjoy, or problem-solving barriers like ${patient.pa.topBarrier}.\n\nWhat's on your mind today?`}
+        quickReplies={["Help me set a PA goal", "I'm struggling to stay motivated", "What activity suits my fitness level?", "How does exercise help with my weight loss?", "Had some side effects this week"]}
+        ragEnabled={withTheory}
+        ragScores={ragScores}
+        {...conv}
+        patient={patient}
+      />
+    </div>
   );
 }
 
@@ -1542,6 +2647,293 @@ function ConversationCard({ entry, onClear }) {
   );
 }
 
+// ─── LLM-as-judge ─────────────────────────────────────────────
+const JUDGE_RUBRIC_CRITERIA = [
+  { id: "open_question",   label: "Open question (MI)",      desc: "AI asks rather than tells; avoids yes/no or leading questions" },
+  { id: "affirm",          label: "Affirmation (PACE/A)",    desc: "Validates experience without judgment; acknowledges effort" },
+  { id: "reflect_summary", label: "Reflect / Summarize (MI)",desc: "Mirrors patient words back; summarises before moving on" },
+  { id: "se_source",       label: "SE source used",          desc: "References mastery, vicarious, verbal persuasion, or affective state" },
+  { id: "bct",             label: "BCT present",             desc: "Goal-setting, action planning, problem-solving, or confidence check" },
+  { id: "personalization", label: "Personalisation",         desc: "References patient's specific barrier, score, or stated context" },
+];
+
+const JUDGE_SCORE_LABELS = ["0 — Absent", "1 — Weak", "2 — Adequate", "3 — Strong"];
+
+const JUDGE_RESULTS_KEY = "confidentMoves_judge_results";
+
+function readJudgeResults() {
+  try { return JSON.parse(localStorage.getItem(JUDGE_RESULTS_KEY) ?? "[]") ?? []; } catch { return []; }
+}
+function saveJudgeResult(result) {
+  try {
+    const prev = readJudgeResults();
+    prev.unshift(result);
+    localStorage.setItem(JUDGE_RESULTS_KEY, JSON.stringify(prev.slice(0, 50)));
+  } catch {}
+}
+
+function buildJudgeSystemPrompt() {
+  return `You are a research assistant scoring AI chatbot responses for a PA behaviour-change study. You will receive one AI assistant message. Score it on exactly 6 criteria using integers 0–3.
+
+Criteria:
+${JUDGE_RUBRIC_CRITERIA.map((c, i) => `${i + 1}. ${c.label}: ${c.desc}\n   0=Absent, 1=Weak, 2=Adequate, 3=Strong`).join("\n")}
+
+Reply ONLY with valid JSON — no prose, no markdown:
+{"open_question":0,"affirm":0,"reflect_summary":0,"se_source":0,"bct":0,"personalization":0,"rationale":"one sentence explaining the lowest score"}`;
+}
+
+async function scoreResponseWithJudge(aiText, conditionId) {
+  const msgs = [{ role: "user", content: `AI response to score (Condition ${conditionId}):\n\n${aiText}` }];
+  let raw = "";
+  await callGroq(msgs, buildJudgeSystemPrompt(), chunk => { raw = chunk; }, { maxTokens: 200, minIntervalMs: 3000 });
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1) throw new Error("Judge returned no JSON");
+  return JSON.parse(raw.slice(start, end + 1));
+}
+
+function JudgePanel() {
+  const [convStore] = useState(() => readConvStore());
+  const [selectedKey, setSelectedKey] = useState("");
+  const [selectedMsgIdx, setSelectedMsgIdx] = useState(-1);
+  const [judging, setJudging] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState("");
+  const [history, setHistory] = useState(() => readJudgeResults());
+
+  const entries = Object.values(convStore).filter(e => e.messages?.some(m => m.role === "assistant" && m.content?.length > 30));
+  const selectedEntry = entries.find(e => e.conversationKey === selectedKey);
+  const assistantMsgs = selectedEntry?.messages?.filter(m => m.role === "assistant" && m.content?.length > 30) ?? [];
+
+  const runJudge = async () => {
+    if (!selectedEntry || selectedMsgIdx < 0) return;
+    const msg = assistantMsgs[selectedMsgIdx];
+    setJudging(true); setResult(null); setError("");
+    try {
+      const scores = await scoreResponseWithJudge(msg.content, selectedEntry.condition ?? "?");
+      const total = JUDGE_RUBRIC_CRITERIA.reduce((s, c) => s + (scores[c.id] ?? 0), 0);
+      const r = {
+        scoredAt: new Date().toISOString(),
+        profileName: selectedEntry.profileName,
+        condition: selectedEntry.condition,
+        moduleLabel: selectedEntry.moduleLabel,
+        messagePreview: msg.content.slice(0, 120),
+        scores,
+        total,
+        maxTotal: JUDGE_RUBRIC_CRITERIA.length * 3,
+        rationale: scores.rationale ?? "",
+      };
+      setResult(r);
+      saveJudgeResult(r);
+      setHistory(readJudgeResults());
+    } catch (e) {
+      setError(String(e?.message ?? e));
+    }
+    setJudging(false);
+  };
+
+  const dlHistory = () => {
+    const h = readJudgeResults();
+    if (!h.length) return;
+    triggerDownload(`judge-scores-${Date.now()}.json`, "application/json", JSON.stringify(h, null, 2));
+  };
+
+  const scoreColor = (v) => v <= 0 ? T.red : v === 1 ? T.amber : v === 2 ? T.gray600 : T.teal;
+  const btnBase = { border: "none", fontFamily: "'DM Sans', sans-serif", fontWeight: 600, fontSize: 12, padding: "7px 12px", borderRadius: 8, cursor: "pointer" };
+
+  return (
+    <div style={{ marginBottom: 24, padding: 16, background: "#fff", border: `1px solid ${T.gray200}`, borderRadius: 10 }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: T.gray500, textTransform: "uppercase", letterSpacing: ".05em", marginBottom: 4 }}>
+        LLM-as-judge scorer (benchmarking)
+      </div>
+      <p style={{ fontSize: 12.5, color: T.gray600, lineHeight: 1.55, marginBottom: 12 }}>
+        Pick any AI response from your conversation logs and score it on 6 theory-fidelity criteria (0–3 each, max 18). Compare across Conditions A / B / C to benchmark theory alignment.
+      </p>
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+        <select value={selectedKey} onChange={e => { setSelectedKey(e.target.value); setSelectedMsgIdx(-1); setResult(null); }}
+          style={{ fontSize: 12, padding: "6px 10px", borderRadius: 6, border: `1px solid ${T.gray300}`, flex: 1, minWidth: 160, fontFamily: "'DM Sans', sans-serif" }}>
+          <option value="">— Choose conversation log —</option>
+          {entries.map(e => (
+            <option key={e.conversationKey} value={e.conversationKey}>
+              {e.profileName} · Cond {e.condition} · {e.moduleLabel}
+            </option>
+          ))}
+        </select>
+        {assistantMsgs.length > 0 && (
+          <select value={selectedMsgIdx} onChange={e => { setSelectedMsgIdx(Number(e.target.value)); setResult(null); }}
+            style={{ fontSize: 12, padding: "6px 10px", borderRadius: 6, border: `1px solid ${T.gray300}`, flex: 2, minWidth: 200, fontFamily: "'DM Sans', sans-serif" }}>
+            <option value={-1}>— Choose AI response to score —</option>
+            {assistantMsgs.map((m, i) => (
+              <option key={i} value={i}>Response #{i + 1}: {m.content.slice(0, 60)}…</option>
+            ))}
+          </select>
+        )}
+      </div>
+
+      {selectedMsgIdx >= 0 && assistantMsgs[selectedMsgIdx] && (
+        <div style={{ fontSize: 11.5, color: T.gray600, background: T.gray100 ?? "#f8fafc", padding: "8px 12px", borderRadius: 6, marginBottom: 10, whiteSpace: "pre-wrap", maxHeight: 80, overflowY: "auto", lineHeight: 1.5 }}>
+          {assistantMsgs[selectedMsgIdx].content}
+        </div>
+      )}
+
+      <button onClick={runJudge} disabled={judging || selectedMsgIdx < 0}
+        style={{ ...btnBase, background: judging || selectedMsgIdx < 0 ? T.gray300 : T.teal, color: "#fff", cursor: judging || selectedMsgIdx < 0 ? "not-allowed" : "pointer", marginBottom: 12 }}>
+        {judging ? "Scoring…" : "▶ Score this response"}
+      </button>
+
+      {error && <div style={{ fontSize: 12, color: T.red, marginBottom: 10 }}>Error: {error}</div>}
+
+      {result && (
+        <div style={{ background: T.tealLight, border: `1px solid ${T.teal}`, borderRadius: 8, padding: "12px 14px", marginBottom: 12 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: T.teal, marginBottom: 8 }}>
+            Total: {result.total} / {result.maxTotal} — {result.profileName} · Condition {result.condition}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "5px 16px", marginBottom: 8 }}>
+            {JUDGE_RUBRIC_CRITERIA.map(c => (
+              <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                <span style={{ fontWeight: 700, color: scoreColor(result.scores[c.id] ?? 0), minWidth: 14 }}>{result.scores[c.id] ?? 0}</span>
+                <span style={{ color: T.gray700 }}>{c.label}</span>
+              </div>
+            ))}
+          </div>
+          {result.rationale && <div style={{ fontSize: 11.5, color: T.gray600, fontStyle: "italic" }}>Note: {result.rationale}</div>}
+        </div>
+      )}
+
+      {history.length > 0 && (
+        <details>
+          <summary style={{ fontSize: 12, fontWeight: 600, color: T.gray600, cursor: "pointer", marginBottom: 6 }}>
+            Score history ({history.length} scored)
+          </summary>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}>
+            {history.slice(0, 10).map((h, i) => (
+              <div key={i} style={{ fontSize: 11.5, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <span style={{ fontWeight: 700, color: T.teal, minWidth: 40 }}>{h.total}/{h.maxTotal}</span>
+                <span style={{ color: T.gray600 }}>{h.profileName} · Cond {h.condition} · {h.moduleLabel}</span>
+                <span style={{ color: T.gray400 }}>{h.messagePreview?.slice(0, 50)}…</span>
+              </div>
+            ))}
+          </div>
+          <button onClick={dlHistory} style={{ ...btnBase, marginTop: 8, background: "#fff", color: T.teal, border: `1px solid ${T.teal}` }}>
+            Export all scores JSON
+          </button>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function FeasibilityPanel() {
+  const [report, setReport] = useState(() => buildFeasibilityReport());
+  const refresh = () => setReport(buildFeasibilityReport());
+  const { apiMetrics, profileReports } = report;
+
+  const statusStyle = (status) => {
+    if (status === "complete") return { bg: T.tealLight, color: T.teal, label: "Complete" };
+    if (status === "in_progress") return { bg: T.amberLight, color: T.amber, label: "In progress" };
+    return { bg: T.gray100 ?? "#f1f5f9", color: T.gray500, label: "Not started" };
+  };
+
+  const btnBase = {
+    border: "none", fontFamily: "'DM Sans', sans-serif",
+    fontWeight: 600, fontSize: 12, padding: "7px 12px", borderRadius: 8, cursor: "pointer",
+  };
+
+  return (
+    <div style={{
+      marginBottom: 24, padding: 16, background: "#fff",
+      border: `1px solid ${T.teal}`, borderRadius: 10,
+    }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: T.teal, textTransform: "uppercase", letterSpacing: ".05em", marginBottom: 4 }}>
+        Feasibility dashboard (Aim 3)
+      </div>
+      <p style={{ fontSize: 12.5, color: T.gray600, lineHeight: 1.55, marginBottom: 14 }}>
+        Pilot metrics for your advisor: instrument completion, API usage, rate limits, and where data is stored in this browser.
+      </p>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 10, marginBottom: 16 }}>
+        {[
+          { label: "API calls", value: report.estimatedApiCalls },
+          { label: "Rate limits (429)", value: apiMetrics.rateLimitHits, warn: apiMetrics.rateLimitHits > 0 },
+          { label: "Chat logs", value: report.conversationLogs },
+          { label: "User turns", value: report.totalUserTurns },
+          { label: "Instruments saved", value: report.instrumentSubmissions },
+          { label: "Model", value: GROQ_MODEL.split("-").slice(-2).join("-"), small: true },
+        ].map(({ label, value, warn, small }) => (
+          <div key={label} style={{ padding: "10px 12px", background: warn ? T.amberLight : T.gray100 ?? "#f8fafc", borderRadius: 8, border: `1px solid ${warn ? T.amber : T.gray200}` }}>
+            <div style={{ fontSize: 10, color: T.gray500, marginBottom: 4 }}>{label}</div>
+            <div style={{ fontSize: small ? 11 : 18, fontWeight: 700, color: warn ? T.amber : T.gray800, wordBreak: "break-word" }}>{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {apiMetrics.rateLimitHits > 0 && (
+        <div style={{ fontSize: 12, color: T.amber, background: T.amberLight, padding: "10px 12px", borderRadius: 8, marginBottom: 14, lineHeight: 1.5 }}>
+          Rate limit hit {apiMetrics.rateLimitHits} time{apiMetrics.rateLimitHits !== 1 ? "s" : ""}.
+          Assessments need ~1 API call per question — pause ~4s between answers. App auto-retries; if it still fails, wait 60s and continue (your answers are saved in the chat log).
+        </div>
+      )}
+
+      {profileReports.map(pr => (
+        <div key={pr.profileId} style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: T.gray700, marginBottom: 8 }}>{pr.profileName} ({pr.profileId})</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {pr.paseAgents.map(a => {
+              const st = statusStyle(a.status);
+              return (
+                <div key={a.code} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, flexWrap: "wrap" }}>
+                  <span style={{ width: 72, fontWeight: 600, color: T.gray600 }}>{a.shortLabel}</span>
+                  <span style={{ fontSize: 10, fontWeight: 600, padding: "2px 8px", borderRadius: 10, background: st.bg, color: st.color }}>{st.label}</span>
+                  <div style={{ flex: 1, minWidth: 100, height: 6, background: T.gray200, borderRadius: 3, overflow: "hidden" }}>
+                    <div style={{ width: `${a.completionPct}%`, height: "100%", background: a.status === "complete" ? T.teal : T.amber, borderRadius: 3 }} />
+                  </div>
+                  <span style={{ color: T.gray500, minWidth: 88 }}>{a.answered}/{a.expected} items</span>
+                  {a.totalScore != null && <span style={{ color: T.teal, fontWeight: 600 }}>score {a.totalScore}</span>}
+                </div>
+              );
+            })}
+            <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12 }}>
+              <span style={{ width: 72, fontWeight: 600, color: T.gray600 }}>SERPA</span>
+              <span style={{ fontSize: 10, fontWeight: 600, padding: "2px 8px", borderRadius: 10, background: statusStyle(pr.serpa.complete ? "complete" : pr.serpa.answered ? "in_progress" : "not_started").bg, color: statusStyle(pr.serpa.complete ? "complete" : pr.serpa.answered ? "in_progress" : "not_started").color }}>
+                {pr.serpa.complete ? "Complete" : pr.serpa.answered ? "In progress" : "Not started"}
+              </span>
+              <span style={{ color: T.gray500 }}>{pr.serpa.answered}/{pr.serpa.expected}</span>
+              {pr.serpa.totalScore != null && <span style={{ color: T.teal, fontWeight: 600 }}>score {pr.serpa.totalScore}</span>}
+            </div>
+          </div>
+        </div>
+      ))}
+
+      <details style={{ marginBottom: 12 }}>
+        <summary style={{ fontSize: 12, fontWeight: 600, color: T.gray600, cursor: "pointer" }}>Where is data stored? (localStorage keys)</summary>
+        <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+          {DATA_STORAGE_MAP.map(row => (
+            <div key={row.key} style={{ fontSize: 11.5, color: T.gray600, lineHeight: 1.45 }}>
+              <code style={{ fontSize: 10.5, background: T.gray100, padding: "1px 5px", borderRadius: 4 }}>{row.key}</code>
+              <strong style={{ color: T.gray700 }}> — {row.label}:</strong> {row.desc}
+            </div>
+          ))}
+          <p style={{ fontSize: 11, color: T.gray500, margin: "6px 0 0" }}>
+            View raw data: browser DevTools → Application → Local Storage → your site URL. Export JSON/CSV below before clearing browser data.
+          </p>
+        </div>
+      </details>
+
+      <button
+        type="button"
+        onClick={() => triggerDownload(`confident-moves-feasibility-${Date.now()}.json`, "application/json", JSON.stringify(report, null, 2))}
+        style={{ ...btnBase, background: T.teal, color: "#fff", marginRight: 8 }}
+      >
+        Export feasibility report JSON
+      </button>
+      <button type="button" onClick={refresh} style={{ ...btnBase, background: "#fff", color: T.teal, border: `1px solid ${T.teal}` }}>
+        Refresh metrics
+      </button>
+    </div>
+  );
+}
+
 function HistoryModule({ exportPrefix = "export" }) {
   const [convStore, setConvStore] = useState(() => readConvStore());
 
@@ -1614,9 +3006,22 @@ function HistoryModule({ exportPrefix = "export" }) {
     if (!Object.keys(store).length) return;
     triggerDownload(`confident-moves-conversations-${exportPrefix}-${Date.now()}.csv`, "text/csv;charset=utf-8", convStoreToCsv(store));
   };
+  const dlPaseScoresCsv = () => {
+    const csv = paseScoresSummaryCsv();
+    if (!csv.split("\r\n").length > 1) return;
+    triggerDownload(`confident-moves-pase-scores-${Date.now()}.csv`, "text/csv;charset=utf-8", csv);
+  };
+  const dlBenchmarkCsv = () => {
+    const csv = benchmarkCsv();
+    triggerDownload(`confident-moves-benchmark-${Date.now()}.csv`, "text/csv;charset=utf-8", csv);
+  };
 
   return (
     <div style={{ padding: 20, overflowY: "auto", height: "100%" }}>
+
+      <FeasibilityPanel />
+
+      <JudgePanel />
 
       {/* ── Conversation Logs ── */}
       <div style={{ marginBottom: 24 }}>
@@ -1647,8 +3052,46 @@ function HistoryModule({ exportPrefix = "export" }) {
           <button type="button" disabled={convEntries.length === 0} onClick={dlConvCsv} style={{
             ...btnBase, background: "#fff", color: T.tealDark, border: `1px solid ${T.teal}`,
             cursor: convEntries.length ? "pointer" : "not-allowed", opacity: convEntries.length ? 1 : 0.45,
-          }}>Export conversations CSV</button>
+          }}>Export conversations CSV (de-identified)</button>
         </div>
+      </div>
+
+      {/* ── Research-ready data exports ── */}
+      <div style={{ marginBottom: 24, padding: 16, background: "#fff", border: `1px solid ${T.teal}`, borderRadius: 10 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: T.tealDark, textTransform: "uppercase", letterSpacing: ".05em", marginBottom: 6 }}>
+          Research exports (Excel-ready)
+        </div>
+        <p style={{ fontSize: 12.5, color: T.gray600, lineHeight: 1.6, marginBottom: 14 }}>
+          These CSVs are designed for non-technical staff. Open in Excel or Google Sheets directly. All files use <strong>participant code</strong> (PT-0001) — no names are exported.
+        </p>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+          <div>
+            <button type="button" onClick={dlPaseScoresCsv} style={{
+              ...btnBase, background: T.teal, color: "#fff", border: "none", cursor: "pointer",
+            }}>PASE / SERPA scores summary (CSV)</button>
+            <p style={{ fontSize: 11, color: T.gray500, margin: "4px 0 0 0" }}>
+              One row per participant. Each instrument score and plain-English level in its own column.
+            </p>
+          </div>
+          <div>
+            <button type="button" onClick={dlBenchmarkCsv} style={{
+              ...btnBase, background: T.purple, color: "#fff", border: "none", cursor: "pointer",
+            }}>Benchmark / LLM-judge scores (CSV)</button>
+            <p style={{ fontSize: 11, color: T.gray500, margin: "4px 0 0 0" }}>
+              One row per scored AI response. Includes blank <em>human_*</em> columns for your RA to fill in — compare LLM vs human ratings.
+            </p>
+          </div>
+        </div>
+        {GOOGLE_SHEETS_WEBAPP_URL && (
+          <p style={{ fontSize: 11.5, color: T.teal, marginTop: 12, lineHeight: 1.5 }}>
+            Google Sheets sync is active — conversation turns are pushed automatically on every message send.
+          </p>
+        )}
+        {!GOOGLE_SHEETS_WEBAPP_URL && (
+          <p style={{ fontSize: 11.5, color: T.gray400, marginTop: 12, lineHeight: 1.5 }}>
+            Add <code>VITE_GOOGLE_SHEETS_WEBAPP_URL</code> to your <code>.env</code> to enable automatic Google Sheets sync.
+          </p>
+        )}
       </div>
 
       {/* ── Assessment data export ── */}
