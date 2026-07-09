@@ -1,14 +1,55 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
- 
+
+// ─── PRODUCTION LLM MIGRATION (Claude Haiku 4.5) — implementation map ─────────
+// Phase 1 — Backend proxy (required for production; Anthropic key must NOT live in VITE_*)
+//   • Add server route: POST /api/chat (Vercel serverless, Netlify Function, or Express).
+//   • Server env only: ANTHROPIC_API_KEY, LLM_MODEL=claude-haiku-4-5-20251001, LLM_PROVIDER=anthropic.
+//   • Frontend env only: VITE_API_BASE_URL=https://your-host (no LLM API key in browser).
+//   • vite.config.js: optional dev proxy /api → local backend (see comment there).
+//
+// Phase 2 — Provider abstraction (replace direct Groq coupling below)
+//   • Rename callGroq / callGroqOnce → callLLM / callLLMOnce (or keep names, delegate inside).
+//   • callLLMOnce: if VITE_API_BASE_URL set → fetch POST /api/chat with { messages, systemPrompt, maxTokens };
+//     else dev fallback → existing Groq OpenAI-compatible call.
+//   • Server maps request → Anthropic Messages API (api.anthropic.com/v1/messages):
+//     - system prompt → top-level `system` field (NOT role:"system" in messages)
+//     - messages → only user/assistant roles
+//     - headers: x-api-key, anthropic-version: 2023-06-01
+//     - stream: true → SSE events content_block_delta (different from OpenAI choices[0].delta.content)
+//   • Server streams tokens back in one normalized format the client already parses.
+//
+// Phase 3 — Production cutover
+//   • Deploy backend with Haiku; point VITE_API_BASE_URL at it.
+//   • Keep Groq path for local dev (no VITE_API_BASE_URL) or set LLM_PROVIDER=groq on server for staging.
+//   • Tune max_tokens / temperature per module (chat 350, assessments 280, judge 200).
+//
+// Phase 4 — Prompt caching (server-side, optional)
+//   • Long system prompts (buildSystems chatTrained, Condition C instruments) → Anthropic prompt caching
+//     to cut cost/latency on repeated turns.
+//
+// Phase 5 — Reference library + tools (server-side, optional)
+//   • Move retrieveChunks / KNOWLEDGE_CHUNKS search into server tool executor.
+//   • Anthropic tools: search_references, get_reference_by_id; agent loop on server before final stream.
+//   • Disable always-on RAG injection for Condition A when tools are live (see send() + retrieveChunks).
+//
+// Touchpoints in this file: env constants (below), callGroqOnce/callGroq, send(), scoreResponseWithJudge(),
+//   buildResearchExportReport model field, Progress UI model label, error messages in send() catch.
+// ─────────────────────────────────────────────────────────────────────────────
+
 const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_SECRET_KEY;
+// PRODUCTION: remove hard requirement on Groq key when using proxy — require VITE_API_BASE_URL OR Groq key.
 if (!GROQ_API_KEY) {
   throw new Error("VITE_GROQ_API_SECRET_KEY is not set in .env");
 }
 const GROQ_MODEL = import.meta.env.VITE_GROQ_MODEL || "llama-3.1-8b-instant";
+// PRODUCTION: replace with LLM_MODEL_DISPLAY from /api/chat health response, or
+//   const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
+//   const LLM_MODEL = import.meta.env.VITE_LLM_MODEL_DISPLAY || GROQ_MODEL;  // server reports actual model
 
 const API_METRICS_KEY = "confidentMoves_api_metrics";
 const MIN_GROQ_INTERVAL_MS = 2500;
 const ASSESSMENT_GROQ_INTERVAL_MS = 3500;
+// PRODUCTION: rename to MIN_LLM_INTERVAL_MS; rate limiting can move entirely to server (per session/user).
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -37,8 +78,18 @@ function recordApiMetric(event) {
 }
 
 let lastGroqCallFinishedAt = 0;
+// PRODUCTION: rename lastGroqCallFinishedAt → lastLlmCallFinishedAt
 
 async function callGroqOnce(messages, systemPrompt, onChunk, maxTokens = 350) {
+  // PRODUCTION Phase 2 — branch here:
+  //   if (API_BASE_URL) return callProxyOnce(API_BASE_URL + "/api/chat", { messages, systemPrompt, maxTokens }, onChunk);
+  //   else return callGroqDirect(...)  // current implementation below (dev only)
+  //
+  // Server /api/chat handler (new file, e.g. api/chat.js or server/routes/chat.ts):
+  //   1. Validate body; strip/limit message history; optional auth header.
+  //   2. POST https://api.anthropic.com/v1/messages with model claude-haiku-4-5-20251001.
+  //   3. If tools requested later: run tool loop (non-streaming) then stream final answer.
+  //   4. Pipe Anthropic SSE → client as simple text deltas (or teach client new parser below).
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -66,6 +117,9 @@ async function callGroqOnce(messages, systemPrompt, onChunk, maxTokens = 350) {
   const decoder = new TextDecoder();
   let full = "";
 
+  // PRODUCTION: if proxy normalizes to same OpenAI-style SSE, this loop can stay unchanged.
+  // If parsing Anthropic SSE in the client instead, handle event types:
+  //   content_block_delta → delta.text; message_stop → done; error → throw.
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -84,6 +138,8 @@ async function callGroqOnce(messages, systemPrompt, onChunk, maxTokens = 350) {
 }
 
 async function callGroq(messages, systemPrompt, onChunk, options = {}) {
+  // PRODUCTION: rename to callLLM — same signature so send() and scoreResponseWithJudge() need minimal edits.
+  // Retries on 429 and recordApiMetric() can stay here or move to server.
   const minInterval = options.minIntervalMs ?? MIN_GROQ_INTERVAL_MS;
   const maxTokens = options.maxTokens ?? 350;
   const maxRetries = options.maxRetries ?? 4;
@@ -1171,6 +1227,8 @@ function buildFeasibilityReport() {
 
   return {
     generatedAt: new Date().toISOString(),
+    // PRODUCTION: use active LLM model id from server config or last /api/chat response metadata
+    //   (e.g. claude-haiku-4-5-20251001), not GROQ_MODEL hardcoded.
     model: GROQ_MODEL,
     apiMetrics,
     conversationLogs: Object.keys(convStore).length,
@@ -1523,7 +1581,13 @@ const KNOWLEDGE_CHUNKS = [
 /** Lightweight RAG retriever — keyword-based (no embeddings needed for feasibility).
  *  Takes the patient's last message + their known barriers/domains and returns
  *  the top matching chunks to inject into the system prompt.
- *  Phase 2: replace with semantic vector search (pgvector / Pinecone). */
+ *  Phase 2: replace with semantic vector search (pgvector / Pinecone).
+ *
+ *  PRODUCTION Phase 5 — reference library via function calling:
+ *    • Move KNOWLEDGE_CHUNKS + retrieveChunks to server; expose as tools search_references / get_reference_by_id.
+ *    • Remove always-on buildRagBlock() injection in send() when tools are enabled — model pulls refs on demand.
+ *    • Keep retrieveChunks for Condition B/C only, or disable for Condition A to preserve experimental arm.
+ *    • Embeddings search can live in the same server module as /api/chat. */
 function retrieveChunks(userMessage, patientBarrier = "", patientScores = {}, topN = 3) {
   const query = `${userMessage} ${patientBarrier}`.toLowerCase();
 
@@ -1966,6 +2030,8 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
 
     // RAG: retrieve relevant knowledge chunks based on the user's message + patient context.
     // Inject into system prompt for this call only — does not change stored prompts.
+    // PRODUCTION Phase 5: when server-side tools are live, skip this block (or Condition A only);
+    //   pass ragEnabled / conditionId to /api/chat so server runs search_references tool instead.
     let activeSystemPrompt = systems[systemKey];
     if (ragEnabled && systemKey === "chat" && !persistInstrument) {
       const chunks = retrieveChunks(
@@ -1981,6 +2047,8 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
     let finalText = "";
     let finalMsgs = withPlaceholder;
     try {
+      // PRODUCTION: await callLLM(...) — same args; implementation delegates to /api/chat or Groq dev fallback.
+      // Optional: pass moduleId / conditionId in options so server can pick model, enable tools, or apply caching.
       await callGroq(apiMessages, activeSystemPrompt, (chunk) => {
         finalText = chunk;
         setMessages(prev => {
@@ -2040,6 +2108,7 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
         }
       }
     } catch (e) {
+      // PRODUCTION: generic "LLM API error" messaging; 401/403 → proxy/auth; 529 → Anthropic overloaded.
       console.error("❌ Groq API error:", e);
       const errMsg = e?.message || String(e);
       let friendlyMsg = `⚠️ Error: ${errMsg}\n\nCheck the browser console (F12) for details.`;
@@ -2704,6 +2773,8 @@ Reply ONLY with valid JSON — no prose, no markdown:
 async function scoreResponseWithJudge(aiText, conditionId) {
   const msgs = [{ role: "user", content: `AI response to score (Condition ${conditionId}):\n\n${aiText}` }];
   let raw = "";
+  // PRODUCTION: same callLLM() path; judge can use Haiku with maxTokens:200 or Sonnet for stricter scoring.
+  // Consider non-streaming on server for judge (JSON-only output, easier to validate).
   await callGroq(msgs, buildJudgeSystemPrompt(), chunk => { raw = chunk; }, { maxTokens: 200, minIntervalMs: 3000 });
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
@@ -2878,6 +2949,7 @@ function FeasibilityPanel() {
           { label: "Chat logs", value: report.conversationLogs },
           { label: "User turns", value: report.totalUserTurns },
           { label: "Instruments saved", value: report.instrumentSubmissions },
+          // PRODUCTION: display LLM_MODEL from server (e.g. "haiku-4.5") instead of GROQ_MODEL
           { label: "Model", value: GROQ_MODEL.split("-").slice(-2).join("-"), small: true },
         ].map(({ label, value, warn, small }) => (
           <div key={label} style={{ padding: "10px 12px", background: warn ? T.amberLight : T.gray100 ?? "#f8fafc", borderRadius: 8, border: `1px solid ${warn ? T.amber : T.gray200}` }}>
@@ -3649,6 +3721,7 @@ export default function App() {
             <div>
               <div style={{ fontSize: 15, fontWeight: 600, color: T.gray800 }}>{TABS.find(t => t.id === activeTab)?.label}</div>
               <div style={{ fontSize: 12, color: T.gray400 }}>
+                {/* PRODUCTION: replace "Groq AI" with dynamic provider label from LLM_MODEL (e.g. "Claude Haiku") */}
                 {activeTab === "chat" && "Real-time PA coaching, goal setting & whole-person support — Groq AI"}
                 {activeTab === "checkin" && "Daily wellness, activity & medication check-in"}
                 {activeTab === "eligibility" && "Automated program eligibility screening — STEP-OB-24"}
