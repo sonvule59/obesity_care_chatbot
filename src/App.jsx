@@ -263,7 +263,7 @@ async function callGroqOnceWithTools(messages, systemPrompt, onChunk, maxTokens,
     const res = await post({
       model: GROQ_MODEL,
       max_tokens: maxTokens,
-      temperature: 0.3,
+      temperature: 0.1,
       stream: false,
       tools: REFERENCE_TOOLS,
       tool_choice: "auto",
@@ -278,13 +278,20 @@ async function callGroqOnceWithTools(messages, systemPrompt, onChunk, maxTokens,
     const toolCalls = msg.tool_calls ?? [];
 
     if (toolCalls.length > 0) {
-      convo.push({ role: "assistant", content: msg.content ?? "", tool_calls: toolCalls });
+      const asstMsg = { role: "assistant", tool_calls: toolCalls };
+      if (msg.content) asstMsg.content = msg.content;
+      convo.push(asstMsg);
       for (const tc of toolCalls) {
         let toolArgs = {};
         try { toolArgs = JSON.parse(tc.function?.arguments || "{}"); } catch {}
         const result = executeReferenceTool(tc.function?.name, toolArgs);
         if (onToolEvent) onToolEvent({ name: tc.function?.name, args: toolArgs, result });
-        convo.push({ role: "tool", tool_call_id: tc.id, content: result });
+        convo.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          name: tc.function?.name ?? "search_references",
+          content: result,
+        });
       }
       continue; // model now sees tool results
     }
@@ -298,7 +305,7 @@ async function callGroqOnceWithTools(messages, systemPrompt, onChunk, maxTokens,
   const res = await post({
     model: GROQ_MODEL,
     max_tokens: maxTokens,
-    temperature: 0.3,
+    temperature: 0.1,
     stream: false,
     tool_choice: "none",
     messages: convo,
@@ -313,7 +320,8 @@ async function callGroqOnceWithTools(messages, systemPrompt, onChunk, maxTokens,
   return text;
 }
 
-/** Retry/rate-limit wrapper around callGroqOnceWithTools (mirrors callGroq). */
+/** Retry/rate-limit wrapper around callGroqOnceWithTools (mirrors callGroq).
+ *  On tool_use_failed (400), falls back to a plain streaming call without tools. */
 async function callGroqWithTools(messages, systemPrompt, onChunk, options = {}) {
   const minInterval = options.minIntervalMs ?? MIN_GROQ_INTERVAL_MS;
   const maxTokens = options.maxTokens ?? CHAT_MAX_TOKENS;
@@ -333,8 +341,19 @@ async function callGroqWithTools(messages, systemPrompt, onChunk, options = {}) 
     } catch (e) {
       const errMsg = e?.message || String(e);
       const is429 = errMsg.includes("429");
+      const isTool400 = errMsg.includes("400") && (errMsg.includes("tool_use_failed") || errMsg.includes("Failed to call a function"));
       if (is429) recordApiMetric("429");
       else recordApiMetric("error");
+
+      // Groq sometimes rejects malformed tool output — coach without tools rather than failing the turn.
+      if (isTool400) {
+        console.warn("Tool call failed (400) — falling back to plain chat:", errMsg.slice(0, 300));
+        recordApiMetric("call");
+        const full = await callGroqOnce(messages, systemPrompt, onChunk, maxTokens);
+        recordApiMetric("success");
+        lastGroqCallFinishedAt = Date.now();
+        return full;
+      }
 
       if (is429 && attempt < maxRetries) {
         const backoffMs = 6000 * (attempt + 1);
@@ -2342,7 +2361,13 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
       console.error("❌ Groq API error:", e);
       const errMsg = e?.message || String(e);
       let friendlyMsg = `⚠️ Error: ${errMsg}\n\nCheck the browser console (F12) for details.`;
-      if (errMsg.includes("400")) friendlyMsg = "⚠️ API Error 400: Bad request — check your Groq API key and request payload.";
+      if (errMsg.includes("400")) {
+        const groqDetail = errMsg.includes("{") ? errMsg.slice(errMsg.indexOf("{")) : errMsg;
+        friendlyMsg = `⚠️ API Error 400: Bad request.\n\n${groqDetail.slice(0, 400)}`;
+        if (errMsg.includes("tool_use_failed")) {
+          friendlyMsg += "\n\n(Tool calling failed — the app should auto-fallback on retry. If this persists, set VITE_FUNCTION_CALLING=false or add VITE_GROQ_MODEL=llama-3.3-70b-versatile to .env and restart.)";
+        }
+      }
       if (errMsg.includes("403")) friendlyMsg = "⚠️ API Error 403: Permission denied — your Groq key may be invalid or expired.";
       if (errMsg.includes("429")) friendlyMsg = "⚠️ Groq rate limit (429). The app auto-retried several times — wait 30–60 seconds, then send your message again. Tip: pause ~4 seconds between quiz answers during assessments. Free-tier limits are tight; using llama-3.1-8b-instant helps.";
       if (errMsg.includes("Failed to fetch") || errMsg.includes("NetworkError")) friendlyMsg = "⚠️ Network error: Could not reach Groq API. Check your internet connection.";
