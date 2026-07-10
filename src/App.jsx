@@ -3174,6 +3174,7 @@ function FeasibilityPanel() {
         Pilot metrics for your advisor: instrument completion, API usage, rate limits, and where data is stored in this browser.
       </p>
 
+      {/*
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 10, marginBottom: 16 }}>
         {[
           { label: "API calls", value: report.estimatedApiCalls },
@@ -3190,6 +3191,7 @@ function FeasibilityPanel() {
           </div>
         ))}
       </div>
+      */}
 
       {apiMetrics.rateLimitHits > 0 && (
         <div style={{ fontSize: 12, color: T.amber, background: T.amberLight, padding: "10px 12px", borderRadius: 8, marginBottom: 14, lineHeight: 1.5 }}>
