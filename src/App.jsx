@@ -52,9 +52,52 @@ const GROQ_MODEL = import.meta.env.VITE_GROQ_MODEL || "llama-3.1-8b-instant";
 // decides WHEN to retrieve — instead of the always-on keyword RAG injection.
 // RAG is left in the code (commented out in send()) so we can switch back later.
 //   Disable function calling:  VITE_FUNCTION_CALLING=false
-//   Hide the "used references" debug footer:  VITE_TOOL_DEBUG=false
+//   Show tool debug in chat (dev only):  VITE_TOOL_DEBUG=true
 const FUNCTION_CALLING_ENABLED = (import.meta.env.VITE_FUNCTION_CALLING ?? "true") !== "false";
-const SHOW_TOOL_DEBUG = (import.meta.env.VITE_TOOL_DEBUG ?? "true") !== "false";
+const SHOW_TOOL_DEBUG = import.meta.env.VITE_TOOL_DEBUG === "true";
+const TOOL_CALLS_LOG_KEY = "confidentMoves_tool_calls";
+
+/** Log reference-library tool usage for research (not shown in participant chat). */
+function recordReferenceLookups(meta = {}) {
+  try {
+    const raw = localStorage.getItem(TOOL_CALLS_LOG_KEY);
+    const prev = raw ? JSON.parse(raw) : [];
+    const entry = { recordedAt: new Date().toISOString(), ...meta };
+    prev.unshift(entry);
+    localStorage.setItem(TOOL_CALLS_LOG_KEY, JSON.stringify(prev.slice(0, 200)));
+    return entry;
+  } catch { return null; }
+}
+
+function formatReferenceLookups(lookups) {
+  if (!lookups?.length) return "";
+  return lookups
+    .map(l => `search("${l.query ?? ""}") → [${(l.ids ?? []).join(", ") || "none"}]`)
+    .join("; ");
+}
+
+/** Skip tool round-trip for short confirmations (e.g. "Tuesday and Thursday evenings"). */
+function messageLikelyNeedsReferences(text) {
+  const t = String(text ?? "").toLowerCase().trim();
+  if (!t) return false;
+  if (/^(thanks|thank you|ok|okay|yes|sure|got it|sounds good|that works|perfect|great)\b/i.test(t)) return false;
+  if (/^(hi|hello|hey|good morning|good evening)\b/i.test(t)) return false;
+
+  const referenceSignals = [
+    "pain", "hurt", "nausea", "tired", "fatigue", "embarrass", "ashamed", "stressed",
+    "weather", "rain", "busy", "no time", "semaglutide", "glp", "injection", "medication",
+    "barrier", "confidence", "gym", "guideline", "how many", "muscle", "side effect",
+    "alone", "lonely", "self-conscious", "overwhelmed", "anxious",
+  ];
+  if (referenceSignals.some(s => t.includes(s))) return true;
+
+  // Agreeing to a schedule/plan — coach from context; no library lookup
+  if (t.length < 100 && /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|evening|morning|weekend)\b/.test(t)) {
+    return false;
+  }
+
+  return t.length >= 45;
+}
 
 const API_METRICS_KEY = "confidentMoves_api_metrics";
 const MIN_GROQ_INTERVAL_MS = 2500;
@@ -233,91 +276,65 @@ function executeReferenceTool(name, args) {
 
 /** Short nudge appended to the system prompt so the model knows the tool exists. */
 function buildToolInstructionBlock() {
-  return `\n\nREFERENCE TOOL: You have a function \`search_references\` that retrieves clinical/coaching evidence from the study's reference library. Call it BEFORE giving barrier-specific or factual guidance so your advice is grounded. Synthesize results naturally — never paste snippets verbatim or read out reference ids. If no results are relevant, continue with safe general coaching.`;
+  return `\n\nREFERENCE TOOL: You have a function \`search_references\` for barrier-specific or factual clinical questions. Call it BEFORE giving barrier-specific or factual guidance. Do NOT call it for greetings, thanks, short confirmations, or when the participant is agreeing to a specific plan (days/times). Synthesize results naturally — never paste snippets verbatim.`;
 }
 
 /**
- * One completion with tool support. Runs a small non-streaming tool loop:
- *   call → if tool_calls, execute + append results → call again → … → final text.
- * Emits the final answer once via onChunk (non-progressive; fine for testing).
- * onToolEvent({ name, args, result }) fires for each tool call so the UI can show activity.
+ * Tool decision (1 non-streaming call) → optional tool execution → streaming final answer.
+ * Faster UX than multiple non-streaming completions; confirmations skip tools upstream.
  */
 async function callGroqOnceWithTools(messages, systemPrompt, onChunk, maxTokens, onToolEvent) {
-  const convo = [
-    { role: "system", content: systemPrompt },
-    ...messages.map(m => ({ role: m.role, content: m.content || "..." })),
-  ];
-  const MAX_TOOL_ROUNDS = 3;
+  const apiMessages = messages.map(m => ({ role: m.role, content: m.content || "..." }));
 
-  const post = (body) =>
-    fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${GROQ_API_KEY}`,
-      },
-      body: JSON.stringify(body),
-    });
-
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const res = await post({
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
       model: GROQ_MODEL,
-      max_tokens: maxTokens,
+      max_tokens: 150,
       temperature: 0.1,
       stream: false,
       tools: REFERENCE_TOOLS,
       tool_choice: "auto",
-      messages: convo,
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`Groq API error ${res.status}: ${err}`);
-    }
-    const data = await res.json();
-    const msg = data.choices?.[0]?.message ?? {};
-    const toolCalls = msg.tool_calls ?? [];
-
-    if (toolCalls.length > 0) {
-      const asstMsg = { role: "assistant", tool_calls: toolCalls };
-      if (msg.content) asstMsg.content = msg.content;
-      convo.push(asstMsg);
-      for (const tc of toolCalls) {
-        let toolArgs = {};
-        try { toolArgs = JSON.parse(tc.function?.arguments || "{}"); } catch {}
-        const result = executeReferenceTool(tc.function?.name, toolArgs);
-        if (onToolEvent) onToolEvent({ name: tc.function?.name, args: toolArgs, result });
-        convo.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          name: tc.function?.name ?? "search_references",
-          content: result,
-        });
-      }
-      continue; // model now sees tool results
-    }
-
-    const text = msg.content ?? "";
-    if (text) onChunk(text);
-    return text;
-  }
-
-  // Rounds exhausted — force a plain answer without more tools.
-  const res = await post({
-    model: GROQ_MODEL,
-    max_tokens: maxTokens,
-    temperature: 0.1,
-    stream: false,
-    tool_choice: "none",
-    messages: convo,
+      messages: [{ role: "system", content: systemPrompt }, ...apiMessages],
+    }),
   });
   if (!res.ok) {
     const err = await res.text();
     throw new Error(`Groq API error ${res.status}: ${err}`);
   }
+
   const data = await res.json();
-  const text = data.choices?.[0]?.message?.content ?? "";
-  if (text) onChunk(text);
-  return text;
+  const msg = data.choices?.[0]?.message ?? {};
+  const toolCalls = msg.tool_calls ?? [];
+  let activePrompt = systemPrompt;
+
+  if (toolCalls.length > 0) {
+    const collectedChunks = [];
+    for (const tc of toolCalls) {
+      let toolArgs = {};
+      try { toolArgs = JSON.parse(tc.function?.arguments || "{}"); } catch {}
+      const result = executeReferenceTool(tc.function?.name, toolArgs);
+      if (onToolEvent) onToolEvent({ name: tc.function?.name, args: toolArgs, result });
+      try {
+        const parsed = JSON.parse(result);
+        for (const r of parsed.results ?? []) {
+          collectedChunks.push({ id: r.id, text: r.text });
+        }
+      } catch {}
+    }
+    if (collectedChunks.length) {
+      activePrompt += buildRagBlock(collectedChunks);
+    }
+  } else if (msg.content?.trim()) {
+    onChunk(msg.content);
+    return msg.content;
+  }
+
+  return callGroqOnce(apiMessages, activePrompt, onChunk, maxTokens);
 }
 
 /** Retry/rate-limit wrapper around callGroqOnceWithTools (mirrors callGroq).
@@ -707,7 +724,7 @@ function clearConversation(moduleId) {
 
 function convStoreToCsv(store) {
   // One row per turn. participantCode only — no real names in research exports.
-  const headers = ["participantCode","condition","conditionLabel","moduleId","moduleLabel","lastUpdated","turnNumber","role","timestamp","message"];
+  const headers = ["participantCode","condition","conditionLabel","moduleId","moduleLabel","lastUpdated","turnNumber","role","timestamp","message","referenceLookups"];
   const lines = [headers.join(",")];
   for (const entry of Object.values(store)) {
     entry.messages.forEach((msg, idx) => {
@@ -722,6 +739,7 @@ function convStoreToCsv(store) {
         csvEscapeCell(msg.role ?? ""),
         csvEscapeCell(msg.ts ?? ""),
         csvEscapeCell(msg.content ?? ""),
+        csvEscapeCell(formatReferenceLookups(msg.referenceLookups)),
       ].join(","));
     });
   }
@@ -2245,7 +2263,8 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
 
     // ─── FUNCTION CALLING (test) — model pulls references on demand ────────────────
     // Active for PA Coach chat in Conditions B/C (ragEnabled) when FUNCTION_CALLING_ENABLED.
-    const useTools = FUNCTION_CALLING_ENABLED && ragEnabled && systemKey === "chat" && !persistInstrument;
+    const useTools = FUNCTION_CALLING_ENABLED && ragEnabled && systemKey === "chat" && !persistInstrument
+      && messageLikelyNeedsReferences(userMsg);
     if (useTools) activeSystemPrompt = activeSystemPrompt + buildToolInstructionBlock();
 
     let finalText = "";
@@ -2271,16 +2290,7 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
             if (ev?.name !== "search_references") return;
             let ids = [];
             try { ids = (JSON.parse(ev.result)?.results ?? []).map(r => r.id); } catch {}
-            toolsUsed.push({ query: ev.args?.query ?? "", ids });
-            // Show live search status in the assistant bubble while tools run.
-            setMessages(prev => {
-              const updated = [...prev];
-              const last = updated[updated.length - 1];
-              if (last?.role === "assistant") {
-                updated[updated.length - 1] = { ...last, content: `🔍 Searching references: "${ev.args?.query ?? ""}"…` };
-              }
-              return updated;
-            });
+            toolsUsed.push({ query: ev.args?.query ?? "", ids, at: new Date().toISOString() });
           },
         });
       } else {
@@ -2311,20 +2321,42 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
         });
       }
 
-      // TEST-ONLY: show which references the model pulled via function calling.
-      // Turn off with VITE_TOOL_DEBUG=false. (Note: footer is saved to conversation logs.)
-      if (SHOW_TOOL_DEBUG && useTools && toolsUsed.length && finalText && !finalText.startsWith("⚠️")) {
-        const footer =
-          "\n\n———\n🔧 Function calling: " +
-          toolsUsed
-            .map(t => `search("${t.query}") → [${t.ids.length ? t.ids.join(", ") : "no matches"}]`)
-            .join("; ");
-        finalText = finalText + footer;
+      if (!finalText?.trim() && !finalText?.startsWith("⚠️")) {
+        finalText = "I'm here with you — could you say a bit more about what you'd like to focus on?";
+        streamHandler(finalText);
+      }
+
+      if (useTools && toolsUsed.length && finalText && !finalText.startsWith("⚠️")) {
+        recordReferenceLookups({
+          profileId: conversationMeta?.profileId ?? "",
+          condition: conversationMeta?.condition ?? "",
+          moduleId: conversationMeta?.moduleId ?? systemKey,
+          query: toolsUsed.map(t => t.query).join(" | "),
+          referenceIds: [...new Set(toolsUsed.flatMap(t => t.ids ?? []))],
+          toolsUsed,
+        });
         setMessages(prev => {
           const updated = [...prev];
-          const last = updated[updated.length - 1];
-          if (last?.role === "assistant") {
-            updated[updated.length - 1] = { ...last, content: (last.content ?? "") + footer };
+          const lastIdx = updated.length - 1;
+          if (updated[lastIdx]?.role === "assistant") {
+            let msg = { ...updated[lastIdx], referenceLookups: toolsUsed };
+            if (SHOW_TOOL_DEBUG) {
+              const footer = "\n\n———\n🔧 Function calling: " + formatReferenceLookups(toolsUsed);
+              msg = { ...msg, content: (msg.content ?? "") + footer };
+              finalText = finalText + footer;
+            }
+            updated[lastIdx] = msg;
+          }
+          finalMsgs = updated;
+          return updated;
+        });
+      } else if (useTools && toolsUsed.length === 0 && finalText && !finalText.startsWith("⚠️")) {
+        // Tools enabled but model skipped lookup — still note for research logs
+        setMessages(prev => {
+          const updated = [...prev];
+          const lastIdx = updated.length - 1;
+          if (updated[lastIdx]?.role === "assistant") {
+            updated[lastIdx] = { ...updated[lastIdx], referenceLookups: [] };
           }
           finalMsgs = updated;
           return updated;
