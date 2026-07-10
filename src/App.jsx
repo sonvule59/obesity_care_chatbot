@@ -46,9 +46,22 @@ const GROQ_MODEL = import.meta.env.VITE_GROQ_MODEL || "llama-3.1-8b-instant";
 //   const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
 //   const LLM_MODEL = import.meta.env.VITE_LLM_MODEL_DISPLAY || GROQ_MODEL;  // server reports actual model
 
+// ─── FUNCTION CALLING TEST (Groq/OpenAI-compatible tools; use with a tool-capable
+// model like llama-3.3-70b-versatile) ─────────────────────────────────────────
+// When ON, the PA Coach chat exposes a `search_references` tool and the model
+// decides WHEN to retrieve — instead of the always-on keyword RAG injection.
+// RAG is left in the code (commented out in send()) so we can switch back later.
+//   Disable function calling:  VITE_FUNCTION_CALLING=false
+//   Hide the "used references" debug footer:  VITE_TOOL_DEBUG=false
+const FUNCTION_CALLING_ENABLED = (import.meta.env.VITE_FUNCTION_CALLING ?? "true") !== "false";
+const SHOW_TOOL_DEBUG = (import.meta.env.VITE_TOOL_DEBUG ?? "true") !== "false";
+
 const API_METRICS_KEY = "confidentMoves_api_metrics";
 const MIN_GROQ_INTERVAL_MS = 2500;
 const ASSESSMENT_GROQ_INTERVAL_MS = 3500;
+const CHAT_MAX_TOKENS = 450;        // was 350 — 70B follows brevity rules tightly; +100 headroom
+const ASSESSMENT_MAX_TOKENS = 300;  // was 280
+// const JUDGE_MAX_TOKENS = 200;    // LLM-as-judge disabled — restore when benchmarking resumes
 // PRODUCTION: rename to MIN_LLM_INTERVAL_MS; rate limiting can move entirely to server (per session/user).
 
 function sleep(ms) {
@@ -80,7 +93,7 @@ function recordApiMetric(event) {
 let lastGroqCallFinishedAt = 0;
 // PRODUCTION: rename lastGroqCallFinishedAt → lastLlmCallFinishedAt
 
-async function callGroqOnce(messages, systemPrompt, onChunk, maxTokens = 350) {
+async function callGroqOnce(messages, systemPrompt, onChunk, maxTokens = CHAT_MAX_TOKENS) {
   // PRODUCTION Phase 2 — branch here:
   //   if (API_BASE_URL) return callProxyOnce(API_BASE_URL + "/api/chat", { messages, systemPrompt, maxTokens }, onChunk);
   //   else return callGroqDirect(...)  // current implementation below (dev only)
@@ -141,7 +154,7 @@ async function callGroq(messages, systemPrompt, onChunk, options = {}) {
   // PRODUCTION: rename to callLLM — same signature so send() and scoreResponseWithJudge() need minimal edits.
   // Retries on 429 and recordApiMetric() can stay here or move to server.
   const minInterval = options.minIntervalMs ?? MIN_GROQ_INTERVAL_MS;
-  const maxTokens = options.maxTokens ?? 350;
+  const maxTokens = options.maxTokens ?? CHAT_MAX_TOKENS;
   const maxRetries = options.maxRetries ?? 4;
 
   const wait = lastGroqCallFinishedAt + minInterval - Date.now();
@@ -151,6 +164,169 @@ async function callGroq(messages, systemPrompt, onChunk, options = {}) {
     recordApiMetric("call");
     try {
       const full = await callGroqOnce(messages, systemPrompt, onChunk, maxTokens);
+      recordApiMetric("success");
+      lastGroqCallFinishedAt = Date.now();
+      return full;
+    } catch (e) {
+      const errMsg = e?.message || String(e);
+      const is429 = errMsg.includes("429");
+      if (is429) recordApiMetric("429");
+      else recordApiMetric("error");
+
+      if (is429 && attempt < maxRetries) {
+        const backoffMs = 6000 * (attempt + 1);
+        await sleep(backoffMs);
+        continue;
+      }
+      lastGroqCallFinishedAt = Date.now();
+      throw e;
+    }
+  }
+}
+
+// ─── FUNCTION CALLING: reference-library tool (OpenAI-compatible tool schema) ──
+// The model calls search_references(query, limit) when it needs grounded evidence.
+// The executor reuses the existing keyword retriever over KNOWLEDGE_CHUNKS, so no
+// new knowledge base is required to test the mechanism on Groq's 70B model.
+const REFERENCE_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "search_references",
+      description:
+        "Search the ObesityCare clinical reference library for evidence to ground coaching: physical-activity guidelines; Bandura self-efficacy coaching rules by domain (job/transport/domestic/leisure); SERPA barrier strategies (schedule, self-consciousness, pain/discomfort, weather, social support, stress, no encouragement); GLP-1 + exercise facts; and behavior-change technique rules (action planning, confidence check, problem solving). Call this whenever the participant mentions a barrier or asks something where grounded clinical guidance improves the reply. Do NOT call it for greetings or small talk.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description:
+              "Concise natural-language description of what to look up, e.g. 'embarrassed exercising in public' or 'nausea from semaglutide and exercise'.",
+          },
+          limit: {
+            type: "integer",
+            description: "How many reference snippets to return (1-5). Default 3.",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+];
+
+/** Execute a tool call requested by the model. Returns a JSON string (tool result). */
+function executeReferenceTool(name, args) {
+  if (name === "search_references") {
+    const query = String(args?.query ?? "").trim();
+    const limit = Math.max(1, Math.min(5, Number(args?.limit) || 3));
+    const chunks = retrieveChunks(query, "", {}, limit);
+    if (!chunks.length) {
+      return JSON.stringify({
+        results: [],
+        note: "No matching references found. Answer from general knowledge and stay within safe coaching scope.",
+      });
+    }
+    return JSON.stringify({ results: chunks.map(c => ({ id: c.id, text: c.text })) });
+  }
+  return JSON.stringify({ error: `Unknown tool: ${name}` });
+}
+
+/** Short nudge appended to the system prompt so the model knows the tool exists. */
+function buildToolInstructionBlock() {
+  return `\n\nREFERENCE TOOL: You have a function \`search_references\` that retrieves clinical/coaching evidence from the study's reference library. Call it BEFORE giving barrier-specific or factual guidance so your advice is grounded. Synthesize results naturally — never paste snippets verbatim or read out reference ids. If no results are relevant, continue with safe general coaching.`;
+}
+
+/**
+ * One completion with tool support. Runs a small non-streaming tool loop:
+ *   call → if tool_calls, execute + append results → call again → … → final text.
+ * Emits the final answer once via onChunk (non-progressive; fine for testing).
+ * onToolEvent({ name, args, result }) fires for each tool call so the UI can show activity.
+ */
+async function callGroqOnceWithTools(messages, systemPrompt, onChunk, maxTokens, onToolEvent) {
+  const convo = [
+    { role: "system", content: systemPrompt },
+    ...messages.map(m => ({ role: m.role, content: m.content || "..." })),
+  ];
+  const MAX_TOOL_ROUNDS = 3;
+
+  const post = (body) =>
+    fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${GROQ_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const res = await post({
+      model: GROQ_MODEL,
+      max_tokens: maxTokens,
+      temperature: 0.3,
+      stream: false,
+      tools: REFERENCE_TOOLS,
+      tool_choice: "auto",
+      messages: convo,
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Groq API error ${res.status}: ${err}`);
+    }
+    const data = await res.json();
+    const msg = data.choices?.[0]?.message ?? {};
+    const toolCalls = msg.tool_calls ?? [];
+
+    if (toolCalls.length > 0) {
+      convo.push({ role: "assistant", content: msg.content ?? "", tool_calls: toolCalls });
+      for (const tc of toolCalls) {
+        let toolArgs = {};
+        try { toolArgs = JSON.parse(tc.function?.arguments || "{}"); } catch {}
+        const result = executeReferenceTool(tc.function?.name, toolArgs);
+        if (onToolEvent) onToolEvent({ name: tc.function?.name, args: toolArgs, result });
+        convo.push({ role: "tool", tool_call_id: tc.id, content: result });
+      }
+      continue; // model now sees tool results
+    }
+
+    const text = msg.content ?? "";
+    if (text) onChunk(text);
+    return text;
+  }
+
+  // Rounds exhausted — force a plain answer without more tools.
+  const res = await post({
+    model: GROQ_MODEL,
+    max_tokens: maxTokens,
+    temperature: 0.3,
+    stream: false,
+    tool_choice: "none",
+    messages: convo,
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Groq API error ${res.status}: ${err}`);
+  }
+  const data = await res.json();
+  const text = data.choices?.[0]?.message?.content ?? "";
+  if (text) onChunk(text);
+  return text;
+}
+
+/** Retry/rate-limit wrapper around callGroqOnceWithTools (mirrors callGroq). */
+async function callGroqWithTools(messages, systemPrompt, onChunk, options = {}) {
+  const minInterval = options.minIntervalMs ?? MIN_GROQ_INTERVAL_MS;
+  const maxTokens = options.maxTokens ?? CHAT_MAX_TOKENS;
+  const maxRetries = options.maxRetries ?? 4;
+  const onToolEvent = options.onToolEvent;
+
+  const wait = lastGroqCallFinishedAt + minInterval - Date.now();
+  if (wait > 0) await sleep(wait);
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    recordApiMetric("call");
+    try {
+      const full = await callGroqOnceWithTools(messages, systemPrompt, onChunk, maxTokens, onToolEvent);
       recordApiMetric("success");
       lastGroqCallFinishedAt = Date.now();
       return full;
@@ -584,7 +760,9 @@ function paseScoresSummaryCsv() {
 
 /** Benchmark CSV — one row per scored AI response.
  *  Has blank "human_*" columns so coders can fill in scores directly in Excel.
- *  Export → open in Excel → share with RA → calculate kappa. */
+ *  Export → open in Excel → share with RA → calculate kappa.
+ *  DISABLED — LLM-as-judge not in use yet; restore with judge block below. */
+/*
 function benchmarkCsv() {
   const judgeResults = readJudgeResults();
   const headers = [
@@ -617,6 +795,7 @@ function benchmarkCsv() {
   }
   return lines.join("\r\n");
 }
+*/
 
 /** Push de-identified conversation turns to Google Sheets (if configured). */
 async function pushConversationToSheet(entry) {
@@ -1711,7 +1890,7 @@ Top PA barrier: ${patient.pa.topBarrier}. Favorite activity: ${patient.pa.favori
 
   const operatingRules = `OPERATING RULES
 - Never diagnose, prescribe, or change medication instructions. Defer medical decisions to the care team.
-- Keep replies concise (2–5 sentences) unless the user asks for detail.
+- Keep replies warm and focused (about 3–6 sentences) unless the user asks for detail. Include one reflective or open question when it fits.
 - Flag severe side effects, distress, self-harm, or safety concerns with [ESCALATE].
 - You may discuss GLP-1 therapy, obesity, nutrition, PA, and the trial in general educational terms.`;
 
@@ -2028,12 +2207,13 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
 
     const apiMessages = newMessages.slice(-8).map(m => ({ role: m.role, content: m.content }));
 
-    // RAG: retrieve relevant knowledge chunks based on the user's message + patient context.
-    // Inject into system prompt for this call only — does not change stored prompts.
-    // PRODUCTION Phase 5: when server-side tools are live, skip this block (or Condition A only);
-    //   pass ragEnabled / conditionId to /api/chat so server runs search_references tool instead.
     let activeSystemPrompt = systems[systemKey];
-    if (ragEnabled && systemKey === "chat" && !persistInstrument) {
+
+    // ─── RAG (keyword injection) — TEMPORARILY DISABLED for function-calling test ──
+    // Kept intentionally for later. To re-enable RAG, change `false &&` back to just
+    // the condition (and turn function calling off via VITE_FUNCTION_CALLING=false).
+    // eslint-disable-next-line no-constant-condition
+    if (false && ragEnabled && systemKey === "chat" && !persistInstrument) {
       const chunks = retrieveChunks(
         userMsg,
         patient?.pa?.topBarrier ?? "",
@@ -2044,12 +2224,16 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
       if (ragBlock) activeSystemPrompt = activeSystemPrompt + ragBlock;
     }
 
+    // ─── FUNCTION CALLING (test) — model pulls references on demand ────────────────
+    // Active for PA Coach chat in Conditions B/C (ragEnabled) when FUNCTION_CALLING_ENABLED.
+    const useTools = FUNCTION_CALLING_ENABLED && ragEnabled && systemKey === "chat" && !persistInstrument;
+    if (useTools) activeSystemPrompt = activeSystemPrompt + buildToolInstructionBlock();
+
     let finalText = "";
     let finalMsgs = withPlaceholder;
+    const toolsUsed = [];
     try {
-      // PRODUCTION: await callLLM(...) — same args; implementation delegates to /api/chat or Groq dev fallback.
-      // Optional: pass moduleId / conditionId in options so server can pick model, enable tools, or apply caching.
-      await callGroq(apiMessages, activeSystemPrompt, (chunk) => {
+      const streamHandler = (chunk) => {
         finalText = chunk;
         setMessages(prev => {
           const updated = [...prev];
@@ -2057,10 +2241,36 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
           finalMsgs = updated;
           return updated;
         });
-      }, {
-        minIntervalMs: apiMinIntervalMs ?? (persistInstrument ? ASSESSMENT_GROQ_INTERVAL_MS : MIN_GROQ_INTERVAL_MS),
-        maxTokens: persistInstrument ? 280 : 350,
-      });
+      };
+
+      if (useTools) {
+        // Function-calling path (non-streaming tool loop; llama-3.3-70b-versatile).
+        await callGroqWithTools(apiMessages, activeSystemPrompt, streamHandler, {
+          minIntervalMs: apiMinIntervalMs ?? MIN_GROQ_INTERVAL_MS,
+          maxTokens: CHAT_MAX_TOKENS,
+          onToolEvent: (ev) => {
+            if (ev?.name !== "search_references") return;
+            let ids = [];
+            try { ids = (JSON.parse(ev.result)?.results ?? []).map(r => r.id); } catch {}
+            toolsUsed.push({ query: ev.args?.query ?? "", ids });
+            // Show live search status in the assistant bubble while tools run.
+            setMessages(prev => {
+              const updated = [...prev];
+              const last = updated[updated.length - 1];
+              if (last?.role === "assistant") {
+                updated[updated.length - 1] = { ...last, content: `🔍 Searching references: "${ev.args?.query ?? ""}"…` };
+              }
+              return updated;
+            });
+          },
+        });
+      } else {
+        // PRODUCTION: await callLLM(...) — same args; implementation delegates to /api/chat or Groq dev fallback.
+        await callGroq(apiMessages, activeSystemPrompt, streamHandler, {
+          minIntervalMs: apiMinIntervalMs ?? (persistInstrument ? ASSESSMENT_GROQ_INTERVAL_MS : MIN_GROQ_INTERVAL_MS),
+          maxTokens: persistInstrument ? ASSESSMENT_MAX_TOKENS : CHAT_MAX_TOKENS,
+        });
+      }
 
       // After streaming completes, parse [QUIZ:] from the final response (or infer in assessment mode).
       const { quiz: parsedQuiz, cleanText: cleanedText } = parseQuizFromMessage(finalText);
@@ -2076,6 +2286,26 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
           const lastIdx = updated.length - 1;
           if (updated[lastIdx]?.role === "assistant") {
             updated[lastIdx] = { ...updated[lastIdx], content: displayText, quiz };
+          }
+          finalMsgs = updated;
+          return updated;
+        });
+      }
+
+      // TEST-ONLY: show which references the model pulled via function calling.
+      // Turn off with VITE_TOOL_DEBUG=false. (Note: footer is saved to conversation logs.)
+      if (SHOW_TOOL_DEBUG && useTools && toolsUsed.length && finalText && !finalText.startsWith("⚠️")) {
+        const footer =
+          "\n\n———\n🔧 Function calling: " +
+          toolsUsed
+            .map(t => `search("${t.query}") → [${t.ids.length ? t.ids.join(", ") : "no matches"}]`)
+            .join("; ");
+        finalText = finalText + footer;
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role === "assistant") {
+            updated[updated.length - 1] = { ...last, content: (last.content ?? "") + footer };
           }
           finalMsgs = updated;
           return updated;
@@ -2735,7 +2965,8 @@ function ConversationCard({ entry, onClear }) {
   );
 }
 
-// ─── LLM-as-judge ─────────────────────────────────────────────
+// ─── LLM-as-judge — DISABLED (restore when benchmarking resumes) ───────────────
+/*
 const JUDGE_RUBRIC_CRITERIA = [
   { id: "open_question",   label: "Open question (MI)",      desc: "AI asks rather than tells; avoids yes/no or leading questions" },
   { id: "affirm",          label: "Affirmation (PACE/A)",    desc: "Validates experience without judgment; acknowledges effort" },
@@ -2775,7 +3006,7 @@ async function scoreResponseWithJudge(aiText, conditionId) {
   let raw = "";
   // PRODUCTION: same callLLM() path; judge can use Haiku with maxTokens:200 or Sonnet for stricter scoring.
   // Consider non-streaming on server for judge (JSON-only output, easier to validate).
-  await callGroq(msgs, buildJudgeSystemPrompt(), chunk => { raw = chunk; }, { maxTokens: 200, minIntervalMs: 3000 });
+  await callGroq(msgs, buildJudgeSystemPrompt(), chunk => { raw = chunk; }, { maxTokens: JUDGE_MAX_TOKENS, minIntervalMs: 3000 });
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
   if (start === -1 || end === -1) throw new Error("Judge returned no JSON");
@@ -2913,6 +3144,7 @@ function JudgePanel() {
     </div>
   );
 }
+*/
 
 function FeasibilityPanel() {
   const [report, setReport] = useState(() => buildFeasibilityReport());
@@ -3102,17 +3334,18 @@ function HistoryModule({ exportPrefix = "export" }) {
     if (!csv.split("\r\n").length > 1) return;
     triggerDownload(`confident-moves-pase-scores-${Date.now()}.csv`, "text/csv;charset=utf-8", csv);
   };
-  const dlBenchmarkCsv = () => {
-    const csv = benchmarkCsv();
-    triggerDownload(`confident-moves-benchmark-${Date.now()}.csv`, "text/csv;charset=utf-8", csv);
-  };
+  // LLM-as-judge export disabled — restore with judge block
+  // const dlBenchmarkCsv = () => {
+  //   const csv = benchmarkCsv();
+  //   triggerDownload(`confident-moves-benchmark-${Date.now()}.csv`, "text/csv;charset=utf-8", csv);
+  // };
 
   return (
     <div style={{ padding: 20, overflowY: "auto", height: "100%" }}>
 
       <FeasibilityPanel />
 
-      <JudgePanel />
+      {/* <JudgePanel /> — LLM-as-judge disabled; restore when benchmarking resumes */}
 
       {/* ── Conversation Logs ── */}
       <div style={{ marginBottom: 24 }}>
@@ -3164,6 +3397,7 @@ function HistoryModule({ exportPrefix = "export" }) {
               One row per participant. Each instrument score and plain-English level in its own column.
             </p>
           </div>
+          {/* LLM-as-judge benchmark export — disabled
           <div>
             <button type="button" onClick={dlBenchmarkCsv} style={{
               ...btnBase, background: T.purple, color: "#fff", border: "none", cursor: "pointer",
@@ -3172,6 +3406,7 @@ function HistoryModule({ exportPrefix = "export" }) {
               One row per scored AI response. Includes blank <em>human_*</em> columns for your RA to fill in — compare LLM vs human ratings.
             </p>
           </div>
+          */}
         </div>
         {GOOGLE_SHEETS_WEBAPP_URL && (
           <p style={{ fontSize: 11.5, color: T.teal, marginTop: 12, lineHeight: 1.5 }}>
