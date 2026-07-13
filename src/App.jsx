@@ -46,14 +46,16 @@ const GROQ_MODEL = import.meta.env.VITE_GROQ_MODEL || "llama-3.1-8b-instant";
 //   const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
 //   const LLM_MODEL = import.meta.env.VITE_LLM_MODEL_DISPLAY || GROQ_MODEL;  // server reports actual model
 
-// ─── FUNCTION CALLING TEST (Groq/OpenAI-compatible tools; use with a tool-capable
+// ─── FUNCTION CALLING (Groq/OpenAI-compatible tools; use with a tool-capable
 // model like llama-3.3-70b-versatile) ─────────────────────────────────────────
+// CURRENTLY OFF BY DEFAULT — we are running RAG (always-on keyword injection) for
+// now. The function-calling code path is left intact (send() + callGroqWithTools)
+// so we can flip back to on-demand tool retrieval later without a rewrite.
 // When ON, the PA Coach chat exposes a `search_references` tool and the model
-// decides WHEN to retrieve — instead of the always-on keyword RAG injection.
-// RAG is left in the code (commented out in send()) so we can switch back later.
-//   Disable function calling:  VITE_FUNCTION_CALLING=false
+// decides WHEN to retrieve — instead of the always-on RAG injection.
+//   Re-enable function calling:  VITE_FUNCTION_CALLING=true  (turns RAG off automatically)
 //   Show tool debug in chat (dev only):  VITE_TOOL_DEBUG=true
-const FUNCTION_CALLING_ENABLED = (import.meta.env.VITE_FUNCTION_CALLING ?? "true") !== "false";
+const FUNCTION_CALLING_ENABLED = (import.meta.env.VITE_FUNCTION_CALLING ?? "false") === "true";
 const SHOW_TOOL_DEBUG = import.meta.env.VITE_TOOL_DEBUG === "true";
 const TOOL_CALLS_LOG_KEY = "confidentMoves_tool_calls";
 
@@ -612,11 +614,19 @@ function writeProfileScore(profileId, instrumentKey, responses) {
 
 /** Format collected instrument scores into a concise coaching-context block.
  *  Injected into the PA Coach system prompt (Conditions B/C) so the AI
- *  can reference real assessment data when coaching. */
+ *  can reference real assessment data when coaching.
+ *
+ *  INJECTION STRATEGY = STRUCTURED (deterministic) INJECTION.
+ *  We compute self-efficacy tiers and a goal-setting anchor in code (not by the
+ *  model) and hand the AI a compact, already-interpreted summary. This is the
+ *  right approach for patient scores because it is reproducible across arms,
+ *  auditable for the trial, and cheap on tokens — versus asking the model to
+ *  reason over raw item numbers (error-prone) or retrieving them via a tool. */
 function buildScoreContextBlock(scores) {
   if (!scores || Object.keys(scores).length === 0) return "";
 
   const paseRange = (n) => n <= 8 ? "Low (0–8)" : n <= 16 ? "Moderate (9–16)" : "High (17–24)";
+  const paseTier = (n) => n <= 8 ? "low" : n <= 16 ? "moderate" : "high";
 
   const serpaItemLabels = [
     "bad weather", "boredom with available activities", "vacation",
@@ -635,16 +645,20 @@ function buildScoreContextBlock(scores) {
     if (parts.length) lines.push(`Demographics: ${parts.join(", ")}.`);
   }
 
+  // Track each PA-domain self-efficacy score to pick a goal-setting anchor.
+  const domains = [];
+
   const paseMap = [
-    ["inst2", "J-R PASE (job-related PA SE)"],
-    ["inst3", "T-R PASE (transport PA SE)"],
-    ["inst4", "D-R PASE (domestic PA SE)"],
+    ["inst2", "J-R PASE (job-related PA SE)", "job/work PA"],
+    ["inst3", "T-R PASE (transport PA SE)", "transport/active-commute PA"],
+    ["inst4", "D-R PASE (domestic PA SE)", "home/domestic PA"],
   ];
-  for (const [key, label] of paseMap) {
+  for (const [key, label, plain] of paseMap) {
     if (!scores[key]) continue;
     const d = scores[key];
     const tot = d.total_score ?? 0;
     lines.push(`${label}: ${tot}/24 — ${paseRange(tot)}.`);
+    domains.push({ plain, score: tot, tier: paseTier(tot) });
   }
 
   if (scores.inst5) {
@@ -652,6 +666,7 @@ function buildScoreContextBlock(scores) {
     const mt = d.moderate_total ?? 0;
     const vt = d.vigorous_total ?? 0;
     lines.push(`L-R PASE (leisure PA SE): moderate ${mt}/24 (${paseRange(mt)}), vigorous ${vt}/24 (${paseRange(vt)}).`);
+    domains.push({ plain: "leisure/recreational PA", score: mt, tier: paseTier(mt) });
   }
 
   if (scores.inst6) {
@@ -667,11 +682,22 @@ function buildScoreContextBlock(scores) {
 
   if (lines.length === 0) return "";
 
+  // Goal-setting anchor (SE theory / mastery): start where confidence is highest,
+  // then generalize; direct problem-solving toward the lowest-confidence domain.
+  let anchorLine = "";
+  if (domains.length) {
+    const sorted = [...domains].sort((a, b) => b.score - a.score);
+    const strongest = sorted[0];
+    const weakest = sorted[sorted.length - 1];
+    const overall = Math.round(domains.reduce((s, d) => s + d.score, 0) / domains.length);
+    anchorLine = `\nSelf-efficacy snapshot: overall ${paseTier(overall)} (avg ${overall}/24). Highest-confidence domain: ${strongest.plain} (${strongest.tier}). Lowest-confidence domain: ${weakest.plain} (${weakest.tier}).`;
+  }
+
   return `
 
 PATIENT ASSESSMENT DATA — COLLECTED (inject into coaching; do not read raw numbers aloud unless asked):
-${lines.join("\n")}
-→ Coaching focus: personalize around domains with Low SE and named barriers. Use SE theory sources (mastery, affective) and PACE (acceptance, empowerment) to address these specific gaps.`;
+${lines.join("\n")}${anchorLine}
+→ Coaching focus: build first from the highest-confidence PA domain (a mastery win the patient already believes they can do), then extend that success toward lower-confidence domains and named barriers. Use SE theory sources (mastery, vicarious, verbal persuasion, affective) and PACE (partnership, acceptance, compassion, empowerment). Any goal-setting should begin small in a high-confidence domain and only add difficulty as confidence rises (confidence ≥7/10).`;
 }
 
 // ─── Conversation store ────────────────────────────────────────
@@ -1606,10 +1632,104 @@ const DEFAULT_PROFILES = [
     medications: ["Metformin 500mg"],
     pa: { weeklyGoalMins: 150, goalDays: 5, topBarrier: "lack of social support", favoriteActivity: "cycling" },
   },
+  {
+    id: "PT-0004",
+    name: "Angela Brooks",
+    trial: "Pilot Trial",
+    drug: "Semaglutide 2.4mg",
+    totalWeeks: 24,
+    startProgramDay: 1,
+    bmi: { current: 29.8, baseline: 32.6 },
+    weight: { current: 172, baseline: 188, unit: "lbs", goal: 155 },
+    adherence: 97,
+    doctor: "Confident Moves Obesity Care Team",
+    conditions: ["Hyperlipidemia"],
+    medications: ["Atorvastatin 20mg"],
+    pa: { weeklyGoalMins: 150, goalDays: 5, topBarrier: "travel schedule", favoriteActivity: "running" },
+  },
+  {
+    id: "PT-0005",
+    name: "Robert Ellis",
+    trial: "Pilot Trial",
+    drug: "Semaglutide 2.4mg",
+    totalWeeks: 24,
+    startProgramDay: 1,
+    bmi: { current: 41.3, baseline: 42.5 },
+    weight: { current: 268, baseline: 276, unit: "lbs", goal: 230 },
+    adherence: 79,
+    doctor: "Confident Moves Obesity Care Team",
+    conditions: ["Type 2 diabetes", "Sleep apnea", "Chronic low back pain"],
+    medications: ["Metformin 1000mg", "CPAP therapy"],
+    pa: { weeklyGoalMins: 150, goalDays: 5, topBarrier: "physical discomfort / pain", favoriteActivity: "walking the dog" },
+  },
 ];
 
 function cloneProfiles(profiles) {
   return JSON.parse(JSON.stringify(profiles));
+}
+
+// ─── Mock instrument batteries (5 datasets) ────────────────────────────────────
+// Ready-made survey-battery responses per profile so RAG + structured injection
+// have realistic self-efficacy data to work with during development/demo. These
+// mirror the exact shape the assessment flow writes (PASE items 0–4 → /24; SERPA
+// 13 items 0–4 → /52). Each profile has a distinct SE pattern for testing:
+//   PT-0001 mixed (low job SE, time barrier)      PT-0002 pain-driven low domestic/leisure SE
+//   PT-0003 low social-support barrier            PT-0004 uniformly HIGH SE (contrast arm)
+//   PT-0005 uniformly LOW SE, multiple barriers
+const MOCK_PROFILE_SCORES = {
+  "PT-0001": {
+    inst1: { gender: "Male", education: "Graduate degree", employment: "Employed full-time", marital_status: "Single" },
+    inst2: { item1: 1, item2: 1, item3: 2, item4: 1, item5: 1, item6: 2, total_score: 8 },
+    inst3: { item1: 2, item2: 3, item3: 2, item4: 3, item5: 2, item6: 2, total_score: 14 },
+    inst4: { item1: 3, item2: 2, item3: 3, item4: 2, item5: 3, item6: 2, total_score: 15 },
+    inst5: { moderate_total: 13, vigorous_total: 7 },
+    inst6: { item1: 3, item2: 2, item3: 3, item4: 2, item5: 3, item6: 3, item7: 3, item8: 3, item9: 3, item10: 1, item11: 2, item12: 3, item13: 1, total_score: 32 },
+  },
+  "PT-0002": {
+    inst1: { gender: "Female", education: "Some college", employment: "Employed part-time", marital_status: "Married" },
+    inst2: { item1: 2, item2: 2, item3: 3, item4: 2, item5: 2, item6: 3, total_score: 14 },
+    inst3: { item1: 1, item2: 2, item3: 1, item4: 2, item5: 1, item6: 2, total_score: 9 },
+    inst4: { item1: 1, item2: 1, item3: 2, item4: 1, item5: 1, item6: 2, total_score: 8 },
+    inst5: { moderate_total: 7, vigorous_total: 3 },
+    inst6: { item1: 3, item2: 3, item3: 3, item4: 2, item5: 1, item6: 2, item7: 3, item8: 3, item9: 3, item10: 3, item11: 3, item12: 2, item13: 3, total_score: 34 },
+  },
+  "PT-0003": {
+    inst1: { gender: "Male", education: "Bachelor's degree", employment: "Employed full-time", marital_status: "Divorced" },
+    inst2: { item1: 3, item2: 3, item3: 3, item4: 2, item5: 3, item6: 3, total_score: 17 },
+    inst3: { item1: 3, item2: 2, item3: 3, item4: 3, item5: 2, item6: 3, total_score: 16 },
+    inst4: { item1: 2, item2: 3, item3: 2, item4: 3, item5: 2, item6: 3, total_score: 15 },
+    inst5: { moderate_total: 15, vigorous_total: 12 },
+    inst6: { item1: 3, item2: 3, item3: 3, item4: 3, item5: 3, item6: 1, item7: 3, item8: 3, item9: 3, item10: 3, item11: 3, item12: 1, item13: 3, total_score: 35 },
+  },
+  "PT-0004": {
+    inst1: { gender: "Female", education: "Graduate degree", employment: "Employed full-time", marital_status: "Married" },
+    inst2: { item1: 3, item2: 4, item3: 3, item4: 4, item5: 3, item6: 3, total_score: 20 },
+    inst3: { item1: 4, item2: 3, item3: 4, item4: 3, item5: 4, item6: 3, total_score: 21 },
+    inst4: { item1: 3, item2: 3, item3: 4, item4: 3, item5: 3, item6: 3, total_score: 19 },
+    inst5: { moderate_total: 20, vigorous_total: 18 },
+    inst6: { item1: 4, item2: 3, item3: 4, item4: 3, item5: 4, item6: 3, item7: 4, item8: 3, item9: 4, item10: 1, item11: 4, item12: 3, item13: 3, total_score: 43 },
+  },
+  "PT-0005": {
+    inst1: { gender: "Male", education: "High school", employment: "Not employed (disability)", marital_status: "Widowed" },
+    inst2: { item1: 1, item2: 0, item3: 1, item4: 1, item5: 0, item6: 1, total_score: 4 },
+    inst3: { item1: 1, item2: 1, item3: 0, item4: 1, item5: 1, item6: 0, total_score: 4 },
+    inst4: { item1: 1, item2: 1, item3: 1, item4: 0, item5: 1, item6: 1, total_score: 5 },
+    inst5: { moderate_total: 5, vigorous_total: 2 },
+    inst6: { item1: 1, item2: 1, item3: 1, item4: 1, item5: 0, item6: 1, item7: 1, item8: 1, item9: 1, item10: 1, item11: 1, item12: 1, item13: 1, total_score: 12 },
+  },
+};
+
+/** Seed mock instrument batteries for any profile that has none yet.
+ *  Non-destructive: skips a profile if scores already exist (e.g. from a real
+ *  assessment session). Runs once at app init so RAG + injection have data. */
+function seedMockScores() {
+  for (const [profileId, battery] of Object.entries(MOCK_PROFILE_SCORES)) {
+    const existing = readProfileScores(profileId);
+    if (existing && Object.keys(existing).length > 0) continue;
+    for (const [instrumentKey, responses] of Object.entries(battery)) {
+      writeProfileScore(profileId, instrumentKey, responses);
+    }
+  }
 }
 
 function readProfiles() {
@@ -1618,7 +1738,13 @@ function readProfiles() {
     if (!raw) return cloneProfiles(DEFAULT_PROFILES);
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed) || parsed.length === 0) return cloneProfiles(DEFAULT_PROFILES);
-    return parsed;
+    // Append any default profiles missing from an older cached list (e.g. new mock patients).
+    const ids = new Set(parsed.map(p => p?.id));
+    const merged = [...parsed];
+    for (const def of DEFAULT_PROFILES) {
+      if (!ids.has(def.id)) merged.push(JSON.parse(JSON.stringify(def)));
+    }
+    return merged;
   } catch {
     return cloneProfiles(DEFAULT_PROFILES);
   }
@@ -2246,11 +2372,17 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
 
     let activeSystemPrompt = systems[systemKey];
 
-    // ─── RAG (keyword injection) — TEMPORARILY DISABLED for function-calling test ──
-    // Kept intentionally for later. To re-enable RAG, change `false &&` back to just
-    // the condition (and turn function calling off via VITE_FUNCTION_CALLING=false).
-    // eslint-disable-next-line no-constant-condition
-    if (false && ragEnabled && systemKey === "chat" && !persistInstrument) {
+    // ─── FUNCTION CALLING — model pulls references on demand (OFF by default) ──────
+    // Active for PA Coach chat in Conditions B/C (ragEnabled) only when
+    // FUNCTION_CALLING_ENABLED. When off, we use always-on RAG injection below.
+    const useTools = FUNCTION_CALLING_ENABLED && ragEnabled && systemKey === "chat" && !persistInstrument
+      && messageLikelyNeedsReferences(userMsg);
+
+    // ─── RAG (keyword injection) — ACTIVE when function calling is off ─────────────
+    // Retrieves the top matching knowledge chunks for the patient's message +
+    // their known barriers/low-SE domains (from injected scores) and grounds the
+    // reply. This is the current retrieval strategy for Conditions B/C.
+    if (!useTools && ragEnabled && systemKey === "chat" && !persistInstrument) {
       const chunks = retrieveChunks(
         userMsg,
         patient?.pa?.topBarrier ?? "",
@@ -2261,10 +2393,6 @@ function ChatEngine({ systemKey, systems, placeholder, quickReplies = [], intro,
       if (ragBlock) activeSystemPrompt = activeSystemPrompt + ragBlock;
     }
 
-    // ─── FUNCTION CALLING (test) — model pulls references on demand ────────────────
-    // Active for PA Coach chat in Conditions B/C (ragEnabled) when FUNCTION_CALLING_ENABLED.
-    const useTools = FUNCTION_CALLING_ENABLED && ragEnabled && systemKey === "chat" && !persistInstrument
-      && messageLikelyNeedsReferences(userMsg);
     if (useTools) activeSystemPrompt = activeSystemPrompt + buildToolInstructionBlock();
 
     let finalText = "";
@@ -3583,6 +3711,7 @@ function applyProgramStateToReact(setters, state) {
 
 export default function App() {
   migrateLegacyProgramState(DEFAULT_PROFILES[0].id);
+  seedMockScores();
 
   const [profiles, setProfiles] = useState(() => readProfiles());
   const [activeProfileId, setActiveProfileId] = useState(loadActiveProfileId);
