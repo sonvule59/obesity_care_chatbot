@@ -3955,14 +3955,11 @@ export default function App() {
       {/* Top bar */}
       <div style={{ background: "#fff", borderBottom: `1px solid ${T.gray200}`, padding: "0 24px", display: "flex", alignItems: "center", gap: 16, minHeight: 56, flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ width: 32, height: 32, borderRadius: 8, background: T.teal, display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="14" cy="3" r="1.5"/>
-              <path d="M17 7l-3 4-4-1-3 6"/>
-              <path d="M7 16l-2 4"/>
-              <path d="M14 11l2 5"/>
-            </svg>
-          </div>
+          <img
+            src="/confident-moves-logo.svg"
+            alt="Confident Moves"
+            style={{ height: 36, width: "auto", display: "block" }}
+          />
           <div>
             <div style={{ fontSize: 14, fontWeight: 700, color: T.gray900, lineHeight: 1 }}>Confident Moves</div>
             <div style={{ fontSize: 11, color: T.gray400, lineHeight: 1.4 }}>Personalized PA support</div>
@@ -3970,10 +3967,6 @@ export default function App() {
         </div>
 
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <Badge children={`${patient.trial}`} color={T.purple} bg={T.purpleLight} />
-          <Badge children={`Condition ${activeCondition}`} color={T.purple} bg={T.purpleLight} />
-          <Badge children={`Day ${programDay} / ${totalProgramDays}`} color={T.tealDark} bg={T.tealLight} />
-          <Badge children={`Week ${programWeek}/${patient.totalWeeks}`} color={T.teal} bg={T.tealLight} />
           <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 12px", border: `1px solid ${T.gray200}`, borderRadius: 20, background: T.gray50 }}>
             <Avatar initials={initials} size={22} />
             <span style={{ fontSize: 12, fontWeight: 500, color: T.gray700 }}>{patient.name}</span>
@@ -4015,70 +4008,6 @@ export default function App() {
           />
 
           <div style={{
-            padding: "9px 11px 11px",
-            margin: "0 10px 8px",
-            borderRadius: 10,
-            background: T.gray50,
-            border: `1px solid ${T.gray200}`,
-          }}>
-            <div style={{ fontSize: 12, fontWeight: 600, color: T.gray500, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 7 }}>Self-report · day {programDay}</div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
-              <div>
-                <label style={{ display: "block", fontSize: 11.5, color: T.gray600, marginBottom: 3 }}>Weight (lb)</label>
-                <input
-                  value={draftWeight}
-                  onChange={e => setDraftWeight(e.target.value)}
-                  inputMode="decimal"
-                  style={{
-                    width: "100%", padding: "7px 9px", borderRadius: 8, border: `1px solid ${T.gray300}`,
-                    fontSize: 13.5, fontFamily: "'DM Sans', sans-serif", background: "#fff",
-                  }}
-                />
-              </div>
-              <div>
-                <label style={{ display: "block", fontSize: 11.5, color: T.gray600, marginBottom: 3 }}>
-                  PA (min){lastPaLogProgramDay === programDay ? " ✓" : ""}
-                </label>
-                <input
-                  value={draftTodayPa}
-                  onChange={e => setDraftTodayPa(e.target.value)}
-                  inputMode="numeric"
-                  placeholder={lastPaLogProgramDay === programDay ? "—" : "30"}
-                  disabled={lastPaLogProgramDay === programDay}
-                  style={{
-                    width: "100%", padding: "7px 9px", borderRadius: 8, border: `1px solid ${T.gray300}`,
-                    fontSize: 13.5, fontFamily: "'DM Sans', sans-serif", background: "#fff",
-                    opacity: lastPaLogProgramDay === programDay ? 0.65 : 1,
-                  }}
-                />
-              </div>
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 6 }}>
-              <button type="button" onClick={applySelfReport} style={{
-                fontFamily: "'DM Sans', sans-serif", fontWeight: 600, fontSize: 12.5,
-                padding: "8px 9px", borderRadius: 8, border: "none", background: T.teal, color: "#fff", cursor: "pointer",
-              }}>Save</button>
-              <button type="button" onClick={markActiveToday} disabled={lastActiveMarkProgramDay === programDay} style={{
-                fontFamily: "'DM Sans', sans-serif", fontWeight: 600, fontSize: 12.5,
-                padding: "8px 9px", borderRadius: 8, border: `1px solid ${T.teal}`, background: "#fff", color: T.tealDark,
-                cursor: lastActiveMarkProgramDay === programDay ? "not-allowed" : "pointer", opacity: lastActiveMarkProgramDay === programDay ? 0.55 : 1,
-              }}>{lastActiveMarkProgramDay === programDay ? "Active ✓" : "+ Active day"}</button>
-            </div>
-            <div style={{ display: "flex", gap: 6 }}>
-              <button type="button" onClick={goNextProgramDay} disabled={programDay >= totalProgramDays} style={{
-                flex: 1, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, fontSize: 11.5,
-                padding: "7px 7px", borderRadius: 8, border: `1px solid ${T.gray300}`, background: "#fff", color: T.gray800,
-                cursor: programDay >= totalProgramDays ? "not-allowed" : "pointer",
-              }}>Next day</button>
-              <button type="button" onClick={resetProgramStart} style={{
-                flex: 1, fontFamily: "'DM Sans', sans-serif", fontWeight: 600, fontSize: 11.5,
-                padding: "7px 7px", borderRadius: 8, border: `1px solid ${T.amber}`, background: T.amberLight, color: T.amber,
-                cursor: "pointer",
-              }}>Reset</button>
-            </div>
-          </div>
-
-          <div style={{
             padding: "7px 10px 10px",
             borderTop: `1px solid ${T.gray100}`,
             display: "grid",
@@ -4105,22 +4034,7 @@ export default function App() {
           </div>
 
           <div style={{ padding: "13px 11px", borderTop: `1px solid ${T.gray200}`, background: "#fff" }}>
-            <div style={{ fontSize: 12, fontWeight: 600, color: T.gray500, textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 8 }}>My Goals</div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-              <MetricCard label="Weekly PA" value={`${weekPaMins}/${patient.pa.weeklyGoalMins}′`} sub={`${paPct}%`} progress={paPct} compact sidebar />
-              <MetricCard label="Active days" value={`${activeDaysThisWeek}/${patient.pa.goalDays}`} sub="week" progress={activeDaysPct} compact sidebar />
-              <MetricCard
-                label="Weight lost"
-                value={`−${weightLoss} lbs`}
-                sub={`${weightGoalPct}% · BMI ${estBmiFromWeight(currentWeight, patient)}`}
-                progress={weightGoalPct}
-                color={T.amber}
-                compact
-                sidebar
-              />
-              <MetricCard label="Program" value={`${programDay}d`} sub={`${trialPct}% done`} progress={trialPct} color={T.purple} compact sidebar />
-            </div>
-            <div style={{ fontSize: 11.5, color: T.gray500, marginTop: 10, paddingTop: 9, borderTop: `1px solid ${T.gray100}` }}>
+            <div style={{ fontSize: 11.5, color: T.gray500 }}>
               <div style={{ marginBottom: 5 }}>
                 <span style={{ fontWeight: 600 }}>Today: </span>
                 <span style={{ color: T.gray700, fontWeight: 500 }}>{todayLabel}</span>
