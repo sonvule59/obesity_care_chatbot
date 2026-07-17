@@ -896,11 +896,13 @@ const T = {
   gray100: "#f1f5f9",
   gray200: "#e2e8f0",
   gray300: "#cbd5e1",
-  gray400: "#94a3b8",
-  gray500: "#64748b",
-  gray600: "#475569",
-  gray700: "#334155",
-  gray800: "#1e293b",
+  // Text-tier grays darkened one step for stronger contrast / readability (WCAG AA).
+  // Border/background tiers (gray50–gray300) intentionally left unchanged.
+  gray400: "#64748b",
+  gray500: "#475569",
+  gray600: "#334155",
+  gray700: "#1e293b",
+  gray800: "#111827",
   gray900: "#0f172a",
   // Chat — distinct assistant vs participant, calm contrast (no loud fills)
   chatAiBubble: "#f1f5f9",
@@ -2045,8 +2047,7 @@ function buildSystems(rt, patient, conditionId = "A") {
   const profileScores = withTheory ? readProfileScores(patient.id) : {};
   const scoreContextBlock = buildScoreContextBlock(profileScores);
 
-  const patientContext = `Patient: ${patient.name}, Trial: ${patient.trial}, Drug: ${patient.drug}.
-Program timeline: Day ${programDay} of ${totalProgramDays} (week ${programWeek} of ${patient.totalWeeks}).
+  const patientContext = `Patient: ${patient.name}.
 Self-report: weight ${currentWeight} lbs; estimated BMI ~${estBmi} (baseline BMI ${patient.bmi.baseline}); this week's PA total ${weeklyPaMins} / ${weeklyPaGoal} min; active days with movement this week: ${activeDaysThisWeek} / ${activeDaysGoal}.
 Comorbidities: ${patient.conditions.join(", ")}.
 Top PA barrier: ${patient.pa.topBarrier}. Favorite activity: ${patient.pa.favoriteActivity}.`;
@@ -2123,7 +2124,7 @@ ${patientContext}
 ${operatingRules}`;
 
   const checkinTrained = `You are ObesityCare Confident Moves AI conducting a structured daily check-in for a clinical trial participant. Use brief, collaborative language grounded in self-efficacy support and motivational interviewing (PACE: Partnership, Acceptance, Compassion, Empowerment). Acknowledge effort; ask one thing at a time; no judgment; reflect before the next question. QUIZ TAGS: If administering a research instrument question with fixed options, append [QUIZ: {...}] as the very last line (see PA Coach format instructions).
-Patient: ${patient.name}, program day ${programDay} (week ${programWeek}), Drug: ${patient.drug}.
+Patient: ${patient.name}.
 Self-reported weight ${currentWeight} lbs; weekly PA minutes so far ${weeklyPaMins} / ${weeklyPaGoal}.
 Conduct a brief, empathetic check-in. Ask ONE question at a time about:
 1. Hunger/appetite (1-10 scale)
@@ -2134,7 +2135,7 @@ Conduct a brief, empathetic check-in. Ask ONE question at a time about:
 Keep each question short. After 5 exchanges, summarize the check-in data in a JSON block like: [CHECKIN_DATA: {...}]`;
 
   const checkinBaseline = `You are ObesityCare AI conducting a structured daily check-in for a clinical trial participant. Be polite and efficient. Do not use motivational interviewing, PACE, self-efficacy, or other named behavior-change approaches.
-Patient: ${patient.name}, program day ${programDay} (week ${programWeek}), Drug: ${patient.drug}.
+Patient: ${patient.name}.
 Self-reported weight ${currentWeight} lbs; weekly PA minutes so far ${weeklyPaMins} / ${weeklyPaGoal}.
 Ask ONE question at a time about:
 1. Hunger/appetite (1-10 scale)
@@ -2145,11 +2146,11 @@ Ask ONE question at a time about:
 Keep each question short. After 5 exchanges, summarize the check-in data in a JSON block like: [CHECKIN_DATA: {...}]`;
 
   const educationTrained = `You are ObesityCare AI, an educational assistant specializing in obesity medicine, GLP-1 therapy, nutrition, and lifestyle modification. Prefer clear, evidence-based statements; when citing mechanisms or guidelines, speak at a population level and avoid overstating certainty. When discussing behavior change, you may briefly reference well-supported ideas (e.g., realistic action planning, building self-efficacy through small successes, and person-centered support via partnership, acceptance, compassion, and empowerment) without claiming individualized treatment.
-The participant is on program day ${programDay} of ${totalProgramDays}. Keep responses to 3-5 sentences unless the user asks for more detail.
+Keep responses to 3-5 sentences unless the user asks for more detail.
 Always end with an invitation to ask a follow-up question.`;
 
   const educationBaseline = `You are ObesityCare AI, an educational assistant for obesity medicine, GLP-1 therapy, nutrition, and lifestyle topics. Give clear, factual answers at a general population level. Do not frame answers using behavior-change theory, self-efficacy, motivational interviewing, PACE, or named coaching models unless the participant asks.
-The participant is on program day ${programDay} of ${totalProgramDays}. Keep responses to 3-5 sentences unless the user asks for more detail.
+Keep responses to 3-5 sentences unless the user asks for more detail.
 Always end with an invitation to ask a follow-up question.`;
 
   return {
@@ -2723,7 +2724,7 @@ If the participant asks about a different domain, warmly redirect: "I'm here spe
   return `${identityBlock}
 Work through each question one at a time in a warm, non-judgmental way (PACE: Partnership, Acceptance, Compassion, Empowerment).
 
-Patient: ${patient.name}, Trial: ${patient.trial}.
+Patient: ${patient.name}.
 
 CRITICAL — QUIZ TAGS (REQUIRED ON EVERY SCORED ITEM): Every response that asks a scored item MUST end with the exact [QUIZ: ...] tag on the very last line — including item 2, 3, 4, etc. Copy the tag verbatim from the instrument text below. Zero characters after the closing ]. Example last line for any PASE/SERPA confidence item:
 ${QUIZ_SCALE_TAG}
@@ -2870,7 +2871,7 @@ function ChatModule({ systems, patient, programDay, programWeek, conditionId, co
         systems={systems}
         systemKey="chat"
         placeholder="Ask about activity goals, barriers, motivation, or your treatment..."
-        intro={`Hello ${patient.name}! I'm your Confident Moves PA coach. I'm here to help you build a sustainable, personalized physical activity routine that works with your body and your life.\n\nToday is program day ${programDay} (week ${programWeek}) — every step counts. We can work on setting goals, finding activities you enjoy, or problem-solving barriers like ${patient.pa.topBarrier}.\n\nWhat's on your mind today?`}
+        intro={`Hello ${patient.name}! I'm your Confident Moves PA coach. I'm here to help you build a sustainable, personalized physical activity routine that works with your body and your life.\n\nWe can work on setting goals, finding activities you enjoy, or problem-solving barriers like ${patient.pa.topBarrier}.\n\nWhat's on your mind today?`}
         quickReplies={["Help me set a PA goal", "I'm struggling to stay motivated", "What activity suits my fitness level?", "How does exercise help with my weight loss?", "Had some side effects this week"]}
         ragEnabled={withTheory}
         ragScores={ragScores}
@@ -2889,7 +2890,7 @@ function CheckInModule({ systems, patient, programDay, programWeek, conditionId,
       systems={systems}
       systemKey="checkin"
       placeholder="Answer today's check-in questions..."
-      intro={`Good morning ${patient.name}! Time for your program day ${programDay} check-in (week ${programWeek}) — it takes about 2 minutes and helps your care team track your whole-person progress.\n\nI'll ask a few short questions covering activity, energy, appetite, and how you're feeling. Let's start: On a scale of 1–10, how would you rate your hunger and appetite today compared to before you started the program?`}
+      intro={`Good morning ${patient.name}! Time for your daily check-in — it takes about 2 minutes and helps your care team track your whole-person progress.\n\nI'll ask a few short questions covering activity, energy, appetite, and how you're feeling. Let's start: On a scale of 1–10, how would you rate your hunger and appetite today compared to before you started the program?`}
       quickReplies={["1–3 (much less hungry)", "4–6 (somewhat less hungry)", "7–10 (about the same)", "I forgot my medication today"]}
       {...conv}
     />
@@ -2919,7 +2920,7 @@ function EducationModule({ systems, patient, programDay, conditionId, conditionL
       systems={systems}
       systemKey="education"
       placeholder="Ask about physical activity, nutrition, your treatment, or obesity medicine..."
-      intro={`Welcome to the Confident Moves Learning Hub! I can explain physical activity guidelines in plain language, share evidence-based tips for building sustainable habits, help you understand your treatment, or answer questions about obesity medicine and whole-person health.\n\nYou're on program day ${programDay}. What would you like to learn about today?`}
+      intro={`Welcome to the Confident Moves Learning Hub! I can explain physical activity guidelines in plain language, share evidence-based tips for building sustainable habits, help you understand your treatment, or answer questions about obesity medicine and whole-person health.\n\nWhat would you like to learn about today?`}
       quickReplies={[
         "How much PA do I need each week?",
         "Best exercises with obesity or joint pain?",
@@ -3961,8 +3962,6 @@ export default function App() {
             style={{ height: 36, width: "auto", display: "block" }}
           />
           <div>
-            <div style={{ fontSize: 14, fontWeight: 700, color: T.gray900, lineHeight: 1 }}>Confident Moves</div>
-            <div style={{ fontSize: 11, color: T.gray400, lineHeight: 1.4 }}>Personalized PA support</div>
           </div>
         </div>
 
@@ -4059,7 +4058,7 @@ export default function App() {
               <div style={{ fontSize: 15, fontWeight: 600, color: T.gray800 }}>{TABS.find(t => t.id === activeTab)?.label}</div>
               <div style={{ fontSize: 12, color: T.gray400 }}>
                 {/* PRODUCTION: replace "Groq AI" with dynamic provider label from LLM_MODEL (e.g. "Claude Haiku") */}
-                {activeTab === "chat" && "Real-time PA coaching, goal setting & whole-person support — Groq AI"}
+                {activeTab === "chat" && ""}
                 {activeTab === "checkin" && "Daily wellness, activity & medication check-in"}
                 {activeTab === "eligibility" && "Automated program eligibility screening — STEP-OB-24"}
                 {activeTab === "education" && "Evidence-based PA education & obesity medicine"}

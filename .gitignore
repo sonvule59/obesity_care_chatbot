@@ -23,3 +23,5 @@ dist-ssr
 *.sln
 *.sw?
 .env
+docs/CODE_REVIEW_2026-07.md
+part5.md
